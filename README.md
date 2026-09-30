@@ -10,6 +10,9 @@ Discord music bot controlled from a web dashboard and Discord text commands.
 - Text commands with the prefix `ave` in any Discord text channel AveBot can read
 - Silent `avejoin` trigger: type `avejoin` (or `ave join`) while you are in a voice channel and AveBot joins you
 - YouTube playback via yt-dlp (search + URL), Spotify track resolution (with public-metadata fallback), direct audio links
+- Resolution order for a text query: yt-dlp (no cookie) -> Spotify/Deezer metadata -> yt-dlp (with cookie) -> 30s preview stream
+- Resolution order for a YouTube URL: yt-dlp (no cookie) -> yt-dlp (with cookie)
+- Resolution order for a Spotify URL: Spotify metadata -> yt-dlp (no cookie) -> yt-dlp (with cookie) -> preview stream
 - YouTube and Spotify playlists (up to 50 tracks per playlist) are queued automatically
 - A track that fails to resolve or stream is skipped automatically so playback keeps going
 - Queue, shuffle, loop (off/track/queue), autoplay
@@ -46,7 +49,7 @@ npm start
 | `SPOTIFY_CLIENT_ID` | Spotify API client ID (optional; falls back to public metadata when unavailable) |
 | `SPOTIFY_CLIENT_SECRET` | Spotify API client secret (optional) |
 | `YTDLP_PATH` | Custom yt-dlp binary path (optional) |
-| `YOUTUBE_COOKIE` | Optional YouTube cookie (JSON export or raw `name=value; ...` header). Helps when YouTube blocks the server IP. |
+| `YOUTUBE_COOKIE` | Optional YouTube cookie (JSON export or raw `name=value; ...` header). Used only as a fallback when yt-dlp without cookies fails. |
 
 ## Discord Setup
 

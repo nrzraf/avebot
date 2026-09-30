@@ -102,18 +102,18 @@ function cookieFile() {
   } catch (e) { log('YouTube', `Invalid YOUTUBE_COOKIE: ${e.message}`); }
   return cookieFilePath;
 }
-function ytdlpArgs(extra = [], allowPlaylist = false) {
+function ytdlpArgs(extra = [], allowPlaylist = false, useCookie = false) {
   const args = ['--no-warnings', '--no-call-home', '--socket-timeout', '15'];
   if (!allowPlaylist) args.push('--no-playlist');
-  const ck = cookieFile();
-  if (ck) args.push('--cookies', ck);
+  if (useCookie) { const ck = cookieFile(); if (ck) args.push('--cookies', ck); }
   return args.concat(extra);
 }
+function hasCookie() { return !!cookieFile(); }
 function ytdlpJson(input, opts = {}) {
   const { cmd, pre } = resolveYtdlp();
   const extra = ['--dump-single-json', '--skip-download'].concat(opts.extra || []);
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, [...pre, ...ytdlpArgs(extra, !!opts.playlist), input], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(cmd, [...pre, ...ytdlpArgs(extra, !!opts.playlist, !!opts.cookie), input], { stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '', err = '';
     child.stdout.on('data', d => out += d);
     child.stderr.on('data', d => err += d);
@@ -142,9 +142,9 @@ function resolveFfmpeg() {
   try { const p = require('ffmpeg-static'); if (p && fs.existsSync(p)) return p; } catch (_) {}
   return 'ffmpeg';
 }
-function ytdlpStream(url) {
+function ytdlpStream(url, useCookie) {
   const { cmd, pre } = resolveYtdlp();
-  const child = spawn(cmd, [...pre, ...ytdlpArgs(['-f', 'bestaudio/best', '-o', '-', '--quiet', url])], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(cmd, [...pre, ...ytdlpArgs(['-f', 'bestaudio/best', '-o', '-', '--quiet', url], false, !!useCookie)], { stdio: ['ignore', 'pipe', 'pipe'] });
   const out = child.stdout;
   out.on('error', () => {});
   child.stderr.on('data', d => { const line = String(d).trim(); if (!line) return; const last = line.split('\n').pop(); if (/Broken pipe|unable to write data/i.test(last)) return; log('YouTube', last); });
@@ -170,21 +170,23 @@ function safeUrl(value) {
   if (host === '::1' || host.startsWith('fe80:') || host.startsWith('fc') || host.startsWith('fd')) throw Error('URL not allowed');
   return u;
 }
-async function findYoutube(q) {
+async function findYoutube(q, useCookie) {
   const isUrl = /^https?:/i.test(q);
   const input = isUrl ? q : `ytsearch1:${q}`;
   const attempts = isUrl ? 1 : 3;
   let v = null, lastErr = null;
   for (let i = 0; i < attempts && !v; i++) {
     try {
-      const info = await ytdlpJson(input);
+      const info = await ytdlpJson(input, { cookie: useCookie });
       const cand = info.entries ? info.entries[0] : info;
       if (cand && cand.webpage_url) v = cand;
     } catch (e) { lastErr = e; log('YouTube', 'Search attempt ' + (i + 1) + ' failed: ' + e.message); }
     if (!v && i < attempts - 1) await new Promise(r => setTimeout(r, 800));
   }
   if (!v) throw Error(lastErr ? lastErr.message : 'No YouTube result');
-  return toTrack(v);
+  const t = toTrack(v);
+  t.cookie = !!useCookie;
+  return t;
 }
 function toTrack(v) {
   const id = v.id || (v.webpage_url && (v.webpage_url.match(/[?&]v=([\w-]+)/) || [])[1]);
@@ -197,10 +199,21 @@ function toTrack(v) {
     platform: 'youtube'
   };
 }
-async function findYoutubeCandidates(q, n) {
-  const info = await ytdlpJson(`ytsearch${n}:${q}`, { playlist: true, extra: ['--flat-playlist'] });
+// Resolve a YouTube URL or search: yt-dlp without cookies first, then with cookies.
+async function resolveYoutube(q) {
+  try { return await findYoutube(q, false); }
+  catch (e) {
+    if (!hasCookie()) throw e;
+    log('YouTube', 'Retrying with YOUTUBE_COOKIE: ' + e.message);
+    return findYoutube(q, true);
+  }
+}
+async function findYoutubeCandidates(q, n, useCookie) {
+  const info = await ytdlpJson(`ytsearch${n}:${q}`, { playlist: true, extra: ['--flat-playlist'], cookie: useCookie });
   const entries = (info.entries || []).filter(Boolean);
-  return entries.map(e => toTrack(e)).filter(t => t.url);
+  const tracks = entries.map(e => toTrack(e)).filter(t => t.url);
+  for (const t of tracks) t.cookie = !!useCookie;
+  return tracks;
 }
 async function autoplayNext(s, done) {
   const seen = new Set(s.recent);
@@ -212,8 +225,11 @@ async function autoplayNext(s, done) {
   ].filter(Boolean);
   for (const q of queries) {
     let cands = [];
-    try { cands = await findYoutubeCandidates(q, 10); }
-    catch (e) { log('Player', 'Autoplay search failed (' + q + '): ' + e.message); continue; }
+    try { cands = await findYoutubeCandidates(q, 10, false); }
+    catch (e) {
+      if (hasCookie()) { try { cands = await findYoutubeCandidates(q, 10, true); } catch (_) {} }
+      if (!cands.length) { log('Player', 'Autoplay search failed (' + q + '): ' + e.message); continue; }
+    }
     const pick = cands.find(t => t.url && !seen.has(t.url) && !/podcast|interview|tutorial|full album|mix\b|reaction/i.test(t.title));
     if (pick) return pick;
     const fallback = cands.find(t => t.url && !seen.has(t.url));
@@ -260,8 +276,20 @@ async function resolveSpotify(url) {
   const meta = await spotifyMeta(canonical);
   const q = [meta.artist, meta.title].filter(Boolean).join(' ') || meta.title;
   log('Spotify', 'Resolving on YouTube: ' + q);
-  const t = await findYoutube(q);
-  return { title: meta.title || t.title, artist: meta.artist || t.artist, url: t.url, duration: meta.duration || t.duration, thumbnail: meta.thumbnail || t.thumbnail, platform: 'spotify' };
+  let t = null;
+  try { t = await findYoutube(q, false); }
+  catch (e) {
+    if (hasCookie()) { try { log('YouTube', 'Spotify resolve retry with YOUTUBE_COOKIE'); t = await findYoutube(q, true); } catch (_) {} }
+    if (!t) {
+      const fb = (await deezerSearch(q)) || (await spotifySearch(q));
+      if (fb && fb.preview) {
+        log('Spotify', 'YouTube unavailable; playing preview stream');
+        return { title: meta.title || fb.title, artist: meta.artist || fb.artist, url: fb.preview, duration: 30000, thumbnail: meta.thumbnail || '', platform: 'direct' };
+      }
+      throw e;
+    }
+  }
+  return { title: meta.title || t.title, artist: meta.artist || t.artist, url: t.url, duration: meta.duration || t.duration, thumbnail: meta.thumbnail || t.thumbnail, platform: 'spotify', cookie: !!t.cookie };
 }
 async function spotifySearch(q) {
   if (!process.env.SPOTIFY_CLIENT_ID || !process.env.SPOTIFY_CLIENT_SECRET) return null;
@@ -320,7 +348,13 @@ async function spotifyPlaylist(url) {
   }));
 }
 async function youtubePlaylist(url) {
-  const info = await ytdlpJson(url, { playlist: true, extra: ['--flat-playlist'] });
+  let info;
+  try { info = await ytdlpJson(url, { playlist: true, extra: ['--flat-playlist'] }); }
+  catch (e) {
+    if (!hasCookie()) throw e;
+    log('YouTube', 'Playlist retry with YOUTUBE_COOKIE: ' + e.message);
+    info = await ytdlpJson(url, { playlist: true, extra: ['--flat-playlist'], cookie: true });
+  }
   const entries = (info.entries || []).filter(Boolean).slice(0, MAX_PLAYLIST);
   if (!entries.length) throw Error('YouTube playlist is empty');
   return entries.map(e => {
@@ -366,28 +400,41 @@ async function resolveOne(q) {
   }
   if (/^https?:/i.test(q)) {
     const u = safeUrl(q);
-    if (/youtube\.com$|youtu\.be$/i.test(u.hostname)) return findYoutube(q);
+    if (/youtube\.com$|youtu\.be$/i.test(u.hostname)) return resolveYoutube(q);
     if (/soundcloud\.com$/i.test(u.hostname)) throw Error('SoundCloud is not supported in this build');
     if (!/\.(mp3|ogg|opus|wav|m4a|aac|flac)(\?|$)/i.test(u.pathname + u.search)) throw Error('URL must point to audio');
     return { title: path.basename(u.pathname), artist: u.hostname, url: u.href, duration: 0, thumbnail: '', platform: 'direct' };
   }
-  try { return await findYoutube(q); }
+  // Text query: yt-dlp (no cookie) -> Spotify/Deezer metadata -> yt-dlp (cookie) -> preview.
+  try { return await findYoutube(q, false); }
   catch (e) {
-    log('YouTube', 'Search failed (' + e.message + '); trying fallback providers');
-    const fb = (await deezerSearch(q)) || (await spotifySearch(q));
-    if (!fb) throw e;
-    const retry = [fb.artist, fb.title].filter(Boolean).join(' ') || q;
-    log('Spotify', 'Fallback query: ' + retry);
-    try {
-      const t = await findYoutube(retry);
-      return { ...t, title: fb.title || t.title, artist: fb.artist || t.artist, platform: 'spotify' };
-    } catch (e2) {
-      if (fb.preview) {
-        log('Spotify', 'YouTube unavailable; playing preview stream');
-        return { title: fb.title, artist: fb.artist, url: fb.preview, duration: 30000, thumbnail: '', platform: 'direct' };
+    log('YouTube', 'Search failed (' + e.message + '); trying Spotify fallback');
+    const fb = (await spotifySearch(q)) || (await deezerSearch(q));
+    if (fb) {
+      const retry = [fb.artist, fb.title].filter(Boolean).join(' ') || q;
+      log('Spotify', 'Fallback query: ' + retry);
+      try {
+        const t = await findYoutube(retry, false);
+        return { ...t, title: fb.title || t.title, artist: fb.artist || t.artist, platform: 'spotify' };
+      } catch (e2) {
+        if (hasCookie()) {
+          try {
+            log('YouTube', 'Retrying fallback with YOUTUBE_COOKIE');
+            const t = await findYoutube(retry, true);
+            return { ...t, title: fb.title || t.title, artist: fb.artist || t.artist, platform: 'spotify' };
+          } catch (_) {}
+        }
+        if (fb.preview) {
+          log('Spotify', 'YouTube unavailable; playing preview stream');
+          return { title: fb.title, artist: fb.artist, url: fb.preview, duration: 30000, thumbnail: '', platform: 'direct' };
+        }
       }
-      throw e;
     }
+    if (hasCookie()) {
+      try { log('YouTube', 'Retrying search with YOUTUBE_COOKIE'); return await findYoutube(q, true); }
+      catch (e3) { log('YouTube', 'Cookie retry failed: ' + e3.message); }
+    }
+    throw e;
   }
 }
 
@@ -410,7 +457,7 @@ async function playCurrent(s, g) {
     const r = await fetch(safeUrl(t.url), { redirect: 'error' });
     if (!r.ok || !r.body || !(r.headers.get('content-type') || '').startsWith('audio/')) throw Error('Audio URL unavailable');
     source = Readable.fromWeb(r.body);
-  } else source = ytdlpStream(t.url);
+  } else source = ytdlpStream(t.url, t.cookie);
   source.on('error', e => { if (g === s.generation) { log('Player', e.message); streamFailed(s, g, e); } });
   const resource = createAudioResource(toPcm(source), { inputType: StreamType.Raw, inlineVolume: true });
   if (resource.volume) resource.volume.setVolume(s.volume / 100);
@@ -420,15 +467,23 @@ async function playCurrent(s, g) {
 }
 // A track that was already playing failed mid-stream (network/ffmpeg/yt-dlp).
 // Bump the generation, stop the player and advance to the next item.
+// A track that was already playing failed mid-stream (network/ffmpeg/yt-dlp).
+// If it was a YouTube track resolved without cookies, retry it once with the
+// cookie before giving up; otherwise skip to the next item.
 function streamFailed(s, g, err) {
   if (g !== s.generation) return;
   const failed = s.currentTrack;
-  if (failed && failed.url) { s.recent.unshift(failed.url); s.recent = s.recent.slice(0, 20); }
   s.error = (err && err.message) || 'Stream failed';
   s.currentTrack = null;
   s.generation++;
   s.status = 'idle'; s.started = 0;
   try { s.player.stop(true); } catch (_) {}
+  if (failed && failed.platform === 'youtube' && !failed.cookie && hasCookie()) {
+    log('YouTube', 'Stream failed (' + s.error + '); retrying with YOUTUBE_COOKIE');
+    s.queue.unshift({ ...failed, cookie: true });
+  } else if (failed && failed.url) {
+    s.recent.unshift(failed.url); s.recent = s.recent.slice(0, 20);
+  }
   setTimeout(() => advance(s, s.generation, false), 0);
 }
 async function advance(s, g, manualSkip) {
@@ -461,8 +516,14 @@ async function advance(s, g, manualSkip) {
       s.currentTrack = next;
       try { await playCurrent(s, ++s.generation); return; }
       catch (e) {
-        s.error = e.message; log('Player', 'Skipping failed track "' + next.title + '": ' + e.message);
-        if (next.url) { s.recent.unshift(next.url); s.recent = s.recent.slice(0, 20); }
+        s.error = e.message;
+        if (next.platform === 'youtube' && !next.cookie && hasCookie()) {
+          log('YouTube', 'Track failed (' + e.message + '); retrying with YOUTUBE_COOKIE');
+          s.queue.unshift({ ...next, cookie: true });
+        } else {
+          log('Player', 'Skipping failed track "' + next.title + '": ' + e.message);
+          if (next.url) { s.recent.unshift(next.url); s.recent = s.recent.slice(0, 20); }
+        }
         s.currentTrack = null;
       }
     }
@@ -626,8 +687,9 @@ app.get('/health',(q,r)=>r.json({ok:true,service:'AveBot'}));app.get('/',(q,r)=>
 app.get('/api/state',(q,r)=>r.json(snapshot(active())));
 app.post('/api/join',(q,r)=>send(r,joinChannel(q.body.channelId)));
 const active=()=>{ if(lastActiveId&&states.has(lastActiveId)) return states.get(lastActiveId); for(const st of states.values()) if(st.connection) return st; return states.values().next().value; };
-for(const [route,cmd] of Object.entries({leave:'leave',play:'play',pause:'pause',resume:'resume',skip:'skip',stop:'stop',queue:'queue',shuffle:'shuffle',loop:'loop',autoplay:'autoplay',volume:'volume','remove-queue-item':'remove'}))app.post(`/api/${route}`,(q,r)=>{const s=active();if(!s)return r.json({ok:false,error:'No active player'});const args=cmd==='play'?[String(q.body.query||'')]:cmd==='volume'?[String(q.body.volume)]:cmd==='loop'?[String(q.body.mode||'')].filter(Boolean):cmd==='autoplay'||cmd==='shuffle'?[String(q.body.state||'')].filter(Boolean):cmd==='remove'?[String(q.body.index)]:[];send(r,run(s,cmd,args));});
-app.use((err,q,r,n)=>{log('Web',err.message);r.status(400).json({ok:false,error:'Invalid request'});});
+for(const [route,cmd] of Object.entries({leave:'leave',play:'play',pause:'pause',resume:'resume',skip:'skip',stop:'stop',queue:'queue',shuffle:'shuffle',loop:'loop',autoplay:'autoplay',volume:'volume','remove-queue-item':'remove'}))app.post(`/api/${route}`,(q,r)=>{try{const s=active();if(!s)return r.json({ok:false,error:'No active player'});const body=q.body||{};const args=cmd==='play'?[String(body.query||'')]:cmd==='volume'?[String(body.volume)]:cmd==='loop'?[String(body.mode||'')].filter(Boolean):cmd==='autoplay'||cmd==='shuffle'?[String(body.state||'')].filter(Boolean):cmd==='remove'?[String(body.index)]:[];send(r,run(s,cmd,args));}catch(e){log('API',e.message);if(!r.headersSent)r.status(200).json({ok:false,error:e.message});}});
+app.use('/api',(q,r)=>r.status(404).json({ok:false,error:'Unknown API endpoint'}));
+app.use((err,q,r,n)=>{log('Web',err.message);if(r.headersSent)return;r.status(400).json({ok:false,error:'Invalid request'});});
 client.once('ready',()=>log('Discord',`Logged in as ${client.user.tag}`));
 process.on('unhandledRejection',e=>log('Discord','Unhandled rejection: '+(e&&e.message?e.message:e)));
 process.on('uncaughtException',e=>log('Discord','Uncaught exception: '+(e&&e.message?e.message:e)));
