@@ -102,9 +102,14 @@ function cookieFile() {
   } catch (e) { log('YouTube', `Invalid YOUTUBE_COOKIE: ${e.message}`); }
   return cookieFilePath;
 }
-function ytdlpArgs(extra = [], allowPlaylist = false, useCookie = false) {
-  const args = ['--no-warnings', '--no-call-home', '--socket-timeout', '15'];
+function ytdlpArgs(extra = [], allowPlaylist = false, useCookie = false, client) {
+  const args = ['--no-warnings', '--socket-timeout', '15'];
   if (!allowPlaylist) args.push('--no-playlist');
+  // Newer yt-dlp defaults logged-in requests to the "tv_downgraded" client, which
+  // YouTube currently rejects with "The page needs to be reloaded" (yt-dlp #17389).
+  // Forcing default+web_embedded works with and without cookies.
+  const pc = client || process.env.YTDLP_PLAYER_CLIENT || 'default,web_embedded';
+  if (pc) args.push('--extractor-args', 'youtube:player_client=' + pc);
   if (useCookie) { const ck = cookieFile(); if (ck) args.push('--cookies', ck); }
   return args.concat(extra);
 }
@@ -142,9 +147,9 @@ function resolveFfmpeg() {
   try { const p = require('ffmpeg-static'); if (p && fs.existsSync(p)) return p; } catch (_) {}
   return 'ffmpeg';
 }
-function ytdlpStream(url, useCookie) {
+function ytdlpStream(url, useCookie, client) {
   const { cmd, pre } = resolveYtdlp();
-  const child = spawn(cmd, [...pre, ...ytdlpArgs(['-f', 'bestaudio/best', '-o', '-', '--quiet', url], false, !!useCookie)], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(cmd, [...pre, ...ytdlpArgs(['-f', 'bestaudio/best', '-o', '-', '--quiet', url], false, !!useCookie, client)], { stdio: ['ignore', 'pipe', 'pipe'] });
   const out = child.stdout;
   out.on('error', () => {});
   child.stderr.on('data', d => { const line = String(d).trim(); if (!line) return; const last = line.split('\n').pop(); if (/Broken pipe|unable to write data/i.test(last)) return; log('YouTube', last); });
@@ -457,7 +462,7 @@ async function playCurrent(s, g) {
     const r = await fetch(safeUrl(t.url), { redirect: 'error' });
     if (!r.ok || !r.body || !(r.headers.get('content-type') || '').startsWith('audio/')) throw Error('Audio URL unavailable');
     source = Readable.fromWeb(r.body);
-  } else source = ytdlpStream(t.url, t.cookie);
+  } else source = ytdlpStream(t.url, t.cookie, t.client);
   source.on('error', e => { if (g === s.generation) { log('Player', e.message); streamFailed(s, g, e); } });
   const resource = createAudioResource(toPcm(source), { inputType: StreamType.Raw, inlineVolume: true });
   if (resource.volume) resource.volume.setVolume(s.volume / 100);
@@ -470,6 +475,8 @@ async function playCurrent(s, g) {
 // A track that was already playing failed mid-stream (network/ffmpeg/yt-dlp).
 // If it was a YouTube track resolved without cookies, retry it once with the
 // cookie before giving up; otherwise skip to the next item.
+// A track failed mid-stream (network/ffmpeg/yt-dlp 403). yt-dlp-backed tracks are
+// retried once with the cookie and once with an alternate player client, then skipped.
 function streamFailed(s, g, err) {
   if (g !== s.generation) return;
   const failed = s.currentTrack;
@@ -478,10 +485,14 @@ function streamFailed(s, g, err) {
   s.generation++;
   s.status = 'idle'; s.started = 0;
   try { s.player.stop(true); } catch (_) {}
-  if (failed && failed.platform === 'youtube' && !failed.cookie && hasCookie()) {
-    log('YouTube', 'Stream failed (' + s.error + '); retrying with YOUTUBE_COOKIE');
-    s.queue.unshift({ ...failed, cookie: true });
+  const ytdlpTrack = failed && failed.url && failed.platform !== 'direct';
+  if (ytdlpTrack && (failed.attempt || 0) < 2) {
+    const attempt = (failed.attempt || 0) + 1;
+    const useCookie = attempt === 1 && hasCookie() && !failed.cookie;
+    log('YouTube', 'Stream failed (' + s.error + '); retry ' + attempt + (useCookie ? ' with cookie' : ' with alternate client'));
+    s.queue.unshift({ ...failed, attempt, cookie: useCookie || !!failed.cookie, client: attempt >= 2 ? 'tv_embedded' : undefined });
   } else if (failed && failed.url) {
+    log('Player', 'Giving up on "' + (failed.title || failed.url) + '": ' + s.error);
     s.recent.unshift(failed.url); s.recent = s.recent.slice(0, 20);
   }
   setTimeout(() => advance(s, s.generation, false), 0);
@@ -517,9 +528,11 @@ async function advance(s, g, manualSkip) {
       try { await playCurrent(s, ++s.generation); return; }
       catch (e) {
         s.error = e.message;
-        if (next.platform === 'youtube' && !next.cookie && hasCookie()) {
-          log('YouTube', 'Track failed (' + e.message + '); retrying with YOUTUBE_COOKIE');
-          s.queue.unshift({ ...next, cookie: true });
+        if (next.url && next.platform !== 'direct' && (next.attempt || 0) < 2) {
+          const attempt = (next.attempt || 0) + 1;
+          const useCookie = attempt === 1 && hasCookie() && !next.cookie;
+          log('YouTube', 'Track failed (' + e.message + '); retry ' + attempt + (useCookie ? ' with cookie' : ' with alternate client'));
+          s.queue.unshift({ ...next, attempt, cookie: useCookie || !!next.cookie, client: attempt >= 2 ? 'tv_embedded' : undefined });
         } else {
           log('Player', 'Skipping failed track "' + next.title + '": ' + e.message);
           if (next.url) { s.recent.unshift(next.url); s.recent = s.recent.slice(0, 20); }

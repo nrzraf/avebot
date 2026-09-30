@@ -1,0 +1,11 @@
+{
+  "$schema": "https://schema.railpack.com",
+  "packages": {
+    "node": "20",
+    "yt-dlp": "latest"
+  },
+  "deploy": {
+    "aptPackages": ["...", "ffmpeg"],
+    "startCommand": "npm start"
+  }
+}

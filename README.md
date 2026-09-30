@@ -49,6 +49,7 @@ npm start
 | `SPOTIFY_CLIENT_ID` | Spotify API client ID (optional; falls back to public metadata when unavailable) |
 | `SPOTIFY_CLIENT_SECRET` | Spotify API client secret (optional) |
 | `YTDLP_PATH` | Custom yt-dlp binary path (optional) |
+| `YTDLP_PLAYER_CLIENT` | Override the yt-dlp YouTube player client (optional; default `default,web_embedded`) |
 | `YOUTUBE_COOKIE` | Optional YouTube cookie (JSON export or raw `name=value; ...` header). Used only as a fallback when yt-dlp without cookies fails. |
 
 ## Discord Setup
@@ -107,7 +108,10 @@ Aliases: `p` play, `next`/`s` skip, `disconnect`/`dc` leave, `q` queue, `mix` sh
 3. Add the environment variables in the Railway dashboard
 4. Deploy
 
-`nixpacks.toml` installs `yt-dlp`, `ffmpeg` and Node.js 20 automatically. The web server listens on `0.0.0.0:$PORT` and exposes `GET /health`.
+The build installs `yt-dlp`, `ffmpeg` and Node.js 20 automatically:
+- Railpack (Railway's current default builder) reads `railpack.json`.
+- Nixpacks reads `nixpacks.toml`.
+Both files are kept in sync, so the deploy works with either builder. The web server listens on `0.0.0.0:$PORT` and exposes `GET /health`.
 
 ## Architecture
 
