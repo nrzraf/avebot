@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AveBot</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0d1117;color:#c9d1d9;min-height:100vh}
+.container{max-width:900px;margin:0 auto;padding:20px}
+h1{text-align:center;font-size:2rem;margin-bottom:24px;color:#58a6ff}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:16px}
+.card h2{font-size:1rem;color:#58a6ff;margin-bottom:12px;text-transform:uppercase;letter-spacing:1px}
+.row{display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap}
+input[type=text],input[type=number]{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:8px 12px;border-radius:6px;flex:1;min-width:120px}
+button{background:#238636;color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:.875rem;white-space:nowrap}
+button:hover{background:#2ea043}
+button.danger{background:#da3633}
+button.danger:hover{background:#f85149}
+button.secondary{background:#30363d}
+button.secondary:hover{background:#484f58}
+.status{display:inline-block;padding:4px 10px;border-radius:12px;font-size:.75rem;font-weight:600}
+.status.connected{background:#238636;color:#fff}
+.status.disconnected{background:#da3633;color:#fff}
+.status.playing{background:#1f6feb;color:#fff}
+.status.paused{background:#d29922;color:#000}
+.status.idle{background:#30363d;color:#c9d1d9}
+.status.error{background:#da3633;color:#fff}
+.track-info{display:flex;gap:16px;align-items:center}
+.track-thumb{width:64px;height:64px;border-radius:6px;object-fit:cover;background:#21262d}
+.track-details{flex:1}
+.track-title{font-weight:600;font-size:1rem}
+.track-artist{color:#8b949e;font-size:.875rem}
+.progress-bar{width:100%;height:6px;background:#21262d;border-radius:3px;margin-top:8px;overflow:hidden}
+.progress-fill{height:100%;background:#58a6ff;border-radius:3px;transition:width .5s linear}
+.time-row{display:flex;justify-content:space-between;font-size:.75rem;color:#8b949e;margin-top:4px}
+.controls{display:flex;gap:8px;flex-wrap:wrap}
+.queue-item{display:flex;align-items:center;padding:8px 0;border-bottom:1px solid #21262d}
+.queue-item:last-child{border-bottom:none}
+.queue-num{width:28px;color:#8b949e;font-size:.875rem}
+.queue-title{flex:1;font-size:.875rem}
+.queue-remove{background:none;border:none;color:#f85149;cursor:pointer;padding:4px 8px;font-size:.75rem}
+.slider-row{display:flex;align-items:center;gap:12px}
+.slider-row input[type=range]{flex:1;accent-color:#58a6ff}
+.toggle{display:flex;gap:8px;align-items:center}
+.toggle button.active{background:#1f6feb}
+select{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:8px 12px;border-radius:6px;min-width:200px;font-size:.875rem}
+select:focus,input:focus{outline:none;border-color:#58a6ff}
+.cmd-row{display:flex;align-items:center;gap:8px;padding:9px 0;border-bottom:1px solid #21262d;flex-wrap:wrap}
+.cmd-row:last-child{border-bottom:none}
+.cmd-row code{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:6px 10px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.82rem;color:#c9d1d9;flex:1;min-width:190px}
+.cmd-desc{color:#8b949e;font-size:.75rem;flex:1;min-width:150px}
+.cmd-row input[type=text]{flex:1;min-width:130px}
+.hint{color:#8b949e;font-size:.78rem;margin-top:6px}
+.error-msg{color:#f85149;font-size:.875rem;margin-top:8px}
+.info-text{color:#8b949e;font-size:.875rem}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>AveBot</h1>
+
+<div class="card">
+<h2>Connection</h2>
+<div class="row">
+<span id="botStatus" class="status disconnected">Disconnected</span>
+<span id="guildName" class="info-text"></span>
+</div>
+<div class="row">
+<input type="text" id="channelId" placeholder="Voice Channel ID">
+<button onclick="joinVoice()">Join Voice</button>
+<button class="danger" onclick="leaveVoice()">Leave Voice</button>
+</div>
+<div id="errorBox" class="error-msg"></div>
+</div>
+
+<div class="card">
+<h2>Now Playing</h2>
+<div id="nowPlaying">
+<div class="info-text">Nothing playing</div>
+</div>
+</div>
+
+<div class="card">
+<h2>Controls</h2>
+<div class="row">
+<input type="text" id="playQuery" placeholder="Song, playlist, or URL">
+<button onclick="playTrack()">Play</button>
+</div>
+<div class="hint" style="margin-bottom:8px">Playlists are queued automatically. A track that fails to load is skipped.</div>
+<div class="controls">
+<button id="btnPauseResume" class="secondary" onclick="sendCmd('pause')">Pause</button>
+<button onclick="sendCmd('skip')">Skip</button>
+<button class="danger" onclick="sendCmd('stop')">Stop</button>
+</div>
+</div>
+
+<div class="card">
+<h2>Settings</h2>
+<div class="row toggle">
+<button id="btnShuffle" class="secondary" onclick="toggleShuffle()">Shuffle: Off</button>
+<button id="btnLoop" class="secondary" onclick="cycleLoop()">Loop: Off</button>
+<button id="btnAutoplay" class="secondary" onclick="toggleAutoplay()">Autoplay: Off</button>
+</div>
+<div class="slider-row" style="margin-top:12px">
+<span>Volume</span>
+<input type="range" id="volSlider" min="0" max="100" value="100" oninput="setVolume(this.value)">
+<span id="volLabel">100</span>
+</div>
+</div>
+
+<div class="card">
+<h2>Queue</h2>
+<div id="queueList"><div class="info-text">Empty</div></div>
+</div>
+
+<div class="card">
+<h2>Commands</h2>
+<div class="hint" style="margin-bottom:10px">Copy a command below and paste it into any Discord text channel AveBot can read. AveBot never replies, reacts, or sends anything back.</div>
+<div id="cmdList"></div>
+</div>
+
+</div>
+<script>
+let loopModes = ['off','track','queue'];
+let loopIdx = 0;
+let autoplayOn = false;
+let shuffleOn = false;
+
+function showError(msg) {
+  document.getElementById('errorBox').textContent = msg || '';
+}
+
+async function api(path, body) {
+  try {
+    const opts = { method: body ? 'POST' : 'GET', headers: { 'Content-Type': 'application/json' } };
+    if (body) opts.body = JSON.stringify(body);
+    const res = await fetch('/api/' + path, opts);
+    const data = await res.json();
+    if (!data.ok && data.error) showError(data.error);
+    else showError('');
+    return data;
+  } catch (e) {
+    showError('API error: ' + e.message);
+    return { ok: false };
+  }
+}
+
+async function joinVoice() {
+  const id = document.getElementById('channelId').value.trim();
+  if (!id) return showError('Enter a Voice Channel ID');
+  await api('join', { channelId: id });
+}
+
+async function leaveVoice() { await api('leave'); }
+
+async function playTrack() {
+  const q = document.getElementById('playQuery').value.trim();
+  if (!q) return;
+  await api('play', { query: q });
+  document.getElementById('playQuery').value = '';
+}
+
+async function sendCmd(cmd) { await api(cmd); }
+
+async function cycleLoop() {
+  loopIdx = (loopIdx + 1) % 3;
+  await api('loop', { mode: loopModes[loopIdx] });
+}
+
+async function toggleShuffle() {
+  await api('shuffle', { state: shuffleOn ? 'off' : 'on' });
+}
+
+async function toggleAutoplay() {
+  await api('autoplay', { state: autoplayOn ? 'off' : 'on' });
+}
+
+const COMMAND_LIST = [
+  { cmd: 'ave join', desc: 'Join your current voice channel' },
+  { cmd: 'ave play <song/url>', desc: 'Play a song (YouTube / Spotify / audio URL)', arg: true, ph: 'Laufey Promise' },
+  { cmd: 'ave play <playlist/url>', desc: 'Queue a YouTube or Spotify playlist', arg: true, ph: 'https://open.spotify.com/playlist/...' },
+  { cmd: 'ave pause', desc: 'Pause playback' },
+  { cmd: 'ave resume', desc: 'Resume playback' },
+  { cmd: 'ave skip', desc: 'Skip to the next track' },
+  { cmd: 'ave stop', desc: 'Stop playback and clear the queue' },
+  { cmd: 'ave leave', desc: 'Disconnect from voice' },
+  { cmd: 'ave queue', desc: 'Show the queue (also on this page)' },
+  { cmd: 'ave shuffle', desc: 'Turn shuffle on' },
+  { cmd: 'ave shuffle on', desc: 'Turn shuffle on' },
+  { cmd: 'ave shuffle off', desc: 'Turn shuffle off' },
+  { cmd: 'ave volume <0-100>', desc: 'Set the volume', arg: true, ph: '70' },
+  { cmd: 'ave remove <index>', desc: 'Remove a queue item by number', arg: true, ph: '2' },
+  { cmd: 'ave loop', desc: 'Loop the current track' },
+  { cmd: 'ave loop track', desc: 'Loop the current track' },
+  { cmd: 'ave loop queue', desc: 'Loop the whole queue' },
+  { cmd: 'ave loop off', desc: 'Turn loop off' },
+  { cmd: 'ave autoplay', desc: 'Turn autoplay on' },
+  { cmd: 'ave autoplay on', desc: 'Turn autoplay on' },
+  { cmd: 'ave autoplay off', desc: 'Turn autoplay off' }
+];
+
+function renderCommands() {
+  const el = document.getElementById('cmdList');
+  el.innerHTML = COMMAND_LIST.map((c, i) =>
+    '<div class="cmd-row">' +
+      '<code id="cmdText' + i + '">' + escapeHtml(c.cmd) + '</code>' +
+      (c.arg ? '<input type="text" id="cmdInput' + i + '" placeholder="' + escapeHtml(c.ph || 'value') + '" oninput="updateCmd(' + i + ')">' : '') +
+      '<span class="cmd-desc">' + escapeHtml(c.desc) + '</span>' +
+      '<button class="secondary" onclick="copyCmd(' + i + ')">Copy</button>' +
+    '</div>'
+  ).join('');
+}
+
+function resolvedCmd(i) {
+  const c = COMMAND_LIST[i];
+  const inp = document.getElementById('cmdInput' + i);
+  const val = inp ? inp.value.trim() : '';
+  if (c.arg && val) return c.cmd.replace(/<[^>]+>/, val);
+  return c.cmd;
+}
+
+function updateCmd(i) {
+  const el = document.getElementById('cmdText' + i);
+  if (el) el.textContent = resolvedCmd(i);
+}
+
+async function copyCmd(i) {
+  const text = resolvedCmd(i);
+  let ok = false;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) { await navigator.clipboard.writeText(text); ok = true; }
+  } catch (e) { ok = false; }
+  if (!ok) {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+      ok = true;
+    } catch (e) { ok = false; }
+  }
+  const btn = event && event.target;
+  if (btn) { const old = btn.textContent; btn.textContent = ok ? 'Copied!' : 'Press Ctrl+C'; setTimeout(function () { btn.textContent = old; }, 1200); }
+}
+
+function formatTime(ms) {
+  if (!ms || ms <= 0) return '0:00';
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  return m + ':' + String(sec).padStart(2, '0');
+}
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function updateUI(state) {
+  const statusEl = document.getElementById('botStatus');
+  const guildEl = document.getElementById('guildName');
+
+  if (state.error) {
+    statusEl.className = 'status error'; statusEl.textContent = 'Error';
+  } else if (state.playing) {
+    statusEl.className = 'status playing'; statusEl.textContent = 'Playing';
+  } else if (state.paused) {
+    statusEl.className = 'status paused'; statusEl.textContent = 'Paused';
+  } else if (state.connected) {
+    const idle = state.currentTrack || (state.queue && state.queue.length > 0);
+    statusEl.className = 'status ' + (idle ? 'idle' : 'connected');
+    statusEl.textContent = idle ? 'Idle' : 'Connected';
+  } else {
+    statusEl.className = 'status disconnected'; statusEl.textContent = 'Disconnected';
+  }
+  guildEl.textContent = state.guild ? state.guild + (state.voiceChannel ? ' (' + state.voiceChannel + ')' : '') : '';
+
+  // Now Playing
+  const npEl = document.getElementById('nowPlaying');
+  if (state.currentTrack) {
+    const t = state.currentTrack;
+    const pct = state.duration > 0 ? Math.min((state.position / state.duration) * 100, 100) : 0;
+    npEl.innerHTML = '<div class="track-info">' +
+      (t.thumbnail ? '<img class="track-thumb" src="' + escapeHtml(t.thumbnail) + '" alt="">' : '<div class="track-thumb"></div>') +
+      '<div class="track-details"><div class="track-title">' + escapeHtml(t.title||'Unknown') + '</div>' +
+      '<div class="track-artist">' + escapeHtml(t.artist||'Unknown') + '</div>' +
+      '<div class="progress-bar"><div class="progress-fill" style="width:' + pct + '%"></div></div>' +
+      '<div class="time-row"><span>' + formatTime(state.position) + '</span><span>' + formatTime(state.duration) + '</span></div>' +
+      '</div></div>';
+  } else {
+    npEl.innerHTML = '<div class="info-text">Nothing playing</div>';
+  }
+
+  // Queue
+  const qEl = document.getElementById('queueList');
+  if (state.queue && state.queue.length > 0) {
+    qEl.innerHTML = state.queue.map(q =>
+      '<div class="queue-item"><span class="queue-num">#' + q.index + '</span><span class="queue-title">' + escapeHtml(q.title) + '</span><button class="queue-remove" onclick="api(\'remove-queue-item\',{index:' + q.index + '})">Remove</button></div>'
+    ).join('');
+  } else {
+    qEl.innerHTML = '<div class="info-text">Empty</div>';
+  }
+
+  // Settings
+  document.getElementById('volSlider').value = state.volume;
+  document.getElementById('volLabel').textContent = state.volume;
+  shuffleOn = !!state.shuffle;
+  const shBtn = document.getElementById('btnShuffle');
+  shBtn.textContent = 'Shuffle: ' + (shuffleOn ? 'On' : 'Off');
+  shBtn.className = shuffleOn ? 'active' : 'secondary';
+
+  loopIdx = loopModes.indexOf(state.loopMode);
+  if (loopIdx < 0) loopIdx = 0;
+  const lpBtn = document.getElementById('btnLoop');
+  lpBtn.textContent = 'Loop: ' + state.loopMode.charAt(0).toUpperCase() + state.loopMode.slice(1);
+  lpBtn.className = state.loopMode !== 'off' ? 'active' : 'secondary';
+
+  autoplayOn = !!state.autoplay;
+  const apBtn = document.getElementById('btnAutoplay');
+  apBtn.textContent = 'Autoplay: ' + (autoplayOn ? 'On' : 'Off');
+  apBtn.className = autoplayOn ? 'active' : 'secondary';
+
+  const pzBtn = document.getElementById('btnPauseResume');
+  if (pzBtn) {
+    pzBtn.textContent = state.paused ? 'Resume' : 'Pause';
+    pzBtn.onclick = function () { sendCmd(state.paused ? 'resume' : 'pause'); };
+  }
+}
+
+async function pollState() {
+  try {
+    const res = await fetch('/api/state');
+    const state = await res.json();
+    showError('');
+    updateUI(state);
+  } catch (e) {
+    showError('Connection lost');
+  }
+}
+
+renderCommands();
+pollState();
+setInterval(pollState, 1000);
+</script>
+</body>
+</html>

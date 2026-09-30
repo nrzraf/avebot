@@ -1,0 +1,11 @@
+[phases.setup]
+nixPkgs = ["nodejs_20", "yt-dlp", "ffmpeg"]
+
+[phases.install]
+cmds = ["npm ci"]
+
+[phases.build]
+cmds = []
+
+[start]
+cmd = "npm start"

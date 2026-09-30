@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Secrets & environment (NEVER commit)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets*
+cookies.txt
+
+# Logs
+npm-debug.log*
+*.log
+
+# Local helper files used during development
+_*
+
+# Runtime cache
+audio_cache/
+
+# OS
+.DS_Store
+Thumbs.db
