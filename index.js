@@ -220,10 +220,23 @@ function resolveFfmpeg() {
   try { const p = require('ffmpeg-static'); if (p && fs.existsSync(p)) return p; } catch (_) {}
   return 'ffmpeg';
 }
+// The (cookie, client) combination that last produced audio. Streaming a new
+// track with the known-good combination avoids re-walking the whole ladder and
+// spawning a burst of yt-dlp processes, which is what makes YouTube throttle.
+let lastGoodStream = null;
 function ytdlpStream(url, useCookie, client) {
   const { cmd, pre } = resolveYtdlp();
-  const child = spawn(cmd, [...pre, ...ytdlpArgs(['-f', 'bestaudio/best', '-o', '-', '--quiet', url], false, !!useCookie, client)], { stdio: ['ignore', 'pipe', 'pipe'] });
+  // Keep the connection alive through small network hiccups: retry the request
+  // and fragments, and use a chunked read so a slow segment cannot stall the
+  // whole pipe (which the audio player would hear as a dropout).
+  const extra = ['-f', 'bestaudio/best', '-o', '-', '--quiet',
+    '--retries', '10', '--fragment-retries', '10',
+    '--http-chunk-size', '1M', '--buffer-size', '1M', url];
+  const child = spawn(cmd, [...pre, ...ytdlpArgs(extra, false, !!useCookie, client)], { stdio: ['ignore', 'pipe', 'pipe'] });
   const out = child.stdout;
+  // Remember a combination once it starts delivering audio.
+  let gotData = false;
+  out.once('data', () => { gotData = true; lastGoodStream = { cookie: !!useCookie, client: client || '' }; });
   out.on('error', () => {});
   child.stderr.on('data', d => { const line = String(d).trim(); if (!line) return; const last = line.split('\n').pop(); if (/Broken pipe|unable to write data/i.test(last)) return; log('YouTube', last); });
   child.on('error', e => out.destroy(e));
@@ -612,8 +625,17 @@ async function playCurrent(s, g) {
     if (!r.ok || !r.body || !(r.headers.get('content-type') || '').startsWith('audio/')) throw Error('Audio URL unavailable');
     source = Readable.fromWeb(r.body);
   } else {
-    const plan = streamPlan();
-    const combo = plan[Math.min(t.planIndex || 0, plan.length - 1)] || { cookie: !!t.cookie, client: t.client };
+    // A track that already knows its plan position uses it; otherwise prefer the
+    // combination that last worked, then fall back to the ordered plan.
+    let combo;
+    if (t.planIndex != null) {
+      const plan = streamPlan();
+      combo = plan[Math.min(t.planIndex, plan.length - 1)] || { cookie: !!t.cookie, client: t.client };
+    } else if (lastGoodStream) {
+      combo = lastGoodStream;
+    } else {
+      combo = streamPlan()[0];
+    }
     source = ytdlpStream(t.url, combo.cookie, combo.client);
   }
   source.on('error', e => { if (g === s.generation) { log('Player', e.message); streamFailed(s, g, e); } });
