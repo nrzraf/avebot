@@ -34,7 +34,7 @@ function parseVoiceCommand(text) {
 function stateFor(id, name='') {
   let s = states.get(id);
   if (!s) {
-    s = { guildId:id, guild:name, channelId:'', channel:'', connection:null, player:createAudioPlayer(), queue:[], currentTrack:null, started:0, pausedAt:0, volume:100, loopMode:'off', autoplay:false, shuffle:false, status:'idle', error:'', generation:0, playingGeneration:0, epoch:0, busy:false, pending:null, leaving:false, recent:[], recentKeys:[] };
+    s = { guildId:id, guild:name, channelId:'', channel:'', connection:null, player:createAudioPlayer({ behaviors: { maxMissedFrames: 50, noSubscriber: 'play' } }), queue:[], currentTrack:null, started:0, pausedAt:0, volume:100, loopMode:'off', autoplay:false, shuffle:false, status:'idle', error:'', generation:0, playingGeneration:0, epoch:0, busy:false, pending:null, leaving:false, recent:[], recentKeys:[] };
     s.player.on(AudioPlayerStatus.Idle, () => advance(s, s.playingGeneration));
     s.player.on('error', e => { log('Player', e.message); s.error=e.message; s.currentTrack=null; s.generation++; advance(s,s.generation); });
     states.set(id,s);
@@ -96,8 +96,13 @@ function cookieFile() {
       const domain = c.domain || '.youtube.com';
       lines.push([domain, domain.startsWith('.') ? 'TRUE' : 'FALSE', c.path || '/', 'FALSE', '0', c.name, c.value].join('\t'));
     }
-    cookieFilePath = path.join(os.tmpdir(), 'avebot-cookies.txt');
-    fs.writeFileSync(cookieFilePath, lines.join('\n') + '\n');
+    const finalPath = path.join(os.tmpdir(), 'avebot-cookies.txt');
+    // Write to a unique temp file, then rename, so concurrent yt-dlp processes
+    // never read a half-written cookie file (which yt-dlp rejects as non-Netscape).
+    const tmpPath = finalPath + '.' + process.pid + '.' + Date.now() + '.tmp';
+    fs.writeFileSync(tmpPath, lines.join('\n') + '\n');
+    fs.renameSync(tmpPath, finalPath);
+    cookieFilePath = finalPath;
     log('YouTube', `Cookie file ready (${cookies.length} cookies)`);
   } catch (e) { log('YouTube', `Invalid YOUTUBE_COOKIE: ${e.message}`); }
   return cookieFilePath;
@@ -271,39 +276,48 @@ function pushRecent(s, t) {
   const k = trackKey(t);
   if (k) { s.recentKeys.unshift(k); s.recentKeys = s.recentKeys.slice(0, 20); }
 }
+// Normalize an artist name so "keshi", "keshi - Topic" and "Keshi Official"
+// all compare equal when deciding whether autoplay stays with the same artist.
+function artistKey(a) {
+  return String(a || '').toLowerCase()
+    .replace(/-\s*topic$/g, ' ')
+    .replace(/\b(vevo|official|music|records|entertainment|topic|channel|band|the)\b/g, ' ')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim();
+}
+function sameArtist(a, b) {
+  const ka = artistKey(a), kb = artistKey(b);
+  if (!ka || !kb) return false;
+  if (ka === kb) return true;
+  // tolerate "keshi" vs "keshi music" and similar suffixed uploader names
+  const [short, long] = ka.length <= kb.length ? [ka, kb] : [kb, ka];
+  return short.length >= 3 && long.startsWith(short + ' ');
+}
 async function autoplayNext(s, done) {
+  if (!done || !done.artist) return null;
   const seenUrls = new Set(s.recent);
   const seenKeys = new Set(s.recentKeys || []);
-  if (done && done.url) seenUrls.add(done.url);
-  if (done) { const dk = trackKey(done); if (dk) seenKeys.add(dk); }
-  // Never autoplay the same song again (even a different uploader of it).
+  if (done.url) seenUrls.add(done.url);
+  { const dk = trackKey(done); if (dk) seenKeys.add(dk); }
+  // Autoplay stays on the SAME artist but must pick a DIFFERENT song.
   const isNew = t => t && t.url && !seenUrls.has(t.url) && !seenKeys.has(trackKey(t));
   const blocked = /podcast|interview|tutorial|full album|mix\b|reaction|compilation|1 hour|\d+\s*(hours?|minutes?)/i;
   const queries = [
-    [done && done.artist, 'official audio'].filter(Boolean).join(' '),
-    [done && done.artist, done && done.title, 'song'].filter(Boolean).join(' '),
-    [done && done.artist, done && done.title].filter(Boolean).join(' ')
+    [done.artist, 'official audio'].filter(Boolean).join(' '),
+    [done.artist, 'songs'].filter(Boolean).join(' '),
+    [done.artist, 'album'].filter(Boolean).join(' ')
   ].filter(Boolean);
   for (const q of queries) {
     let cands = [];
-    try { cands = await findYoutubeCandidates(q, 10, hasCookie()); }
+    try { cands = await findYoutubeCandidates(q, 20, hasCookie()); }
     catch (e) {
-      if (hasCookie()) { try { cands = await findYoutubeCandidates(q, 10, false); } catch (_) {} }
+      if (hasCookie()) { try { cands = await findYoutubeCandidates(q, 20, false); } catch (_) {} }
       if (!cands.length) { log('Player', 'Autoplay search failed (' + q + '): ' + e.message); continue; }
     }
-    // Skip the original artist's own re-uploads: prefer OTHER songs, not the same track.
-    const pick = cands.find(t => isNew(t) && !blocked.test(t.title));
+    const pick = cands.find(t => isNew(t) && sameArtist(t.artist, done.artist) && !blocked.test(t.title));
     if (pick) return pick;
   }
-  // Nothing new in the artist's own catalogue -> pull something from a related query.
-  const rel = [done && done.artist, 'radio'].filter(Boolean).join(' ');
-  if (rel) {
-    try {
-      const cands = await findYoutubeCandidates(rel, 15, hasCookie());
-      const pick = cands.find(t => isNew(t) && !blocked.test(t.title));
-      if (pick) return pick;
-    } catch (_) {}
-  }
+  log('Player', 'Autoplay: no other track found for "' + done.artist + '"');
   return null;
 }
 function spotifyTrackId(value) {
@@ -685,6 +699,18 @@ client.on('messageCreate', async (m) => {
     log('Command', parsed.command + (parsed.args.length ? ' ' + parsed.args.join(' ') : ''));
   } catch (e) { log('Command', e.message); }
 });
+// A user account can only hold ONE voice session, but a hard-killed process leaves
+// a ghost session on Discord's side (the client shows the bot in an old channel).
+// Send a voice-state leave (op 4) for every guild before we join a new one.
+function clearStaleVoiceSessions() {
+  try {
+    const shard = client.ws && client.ws.shards ? client.ws.shards.first() : null;
+    if (!shard) return;
+    for (const g of client.guilds.cache.values()) {
+      try { shard.send({ op: 4, d: { guild_id: g.id, channel_id: null, self_mute: true, self_deaf: true } }); } catch (_) {}
+    }
+  } catch (_) {}
+}
 async function joinChannel(channelId) {
   const id = String(channelId || '').trim();
   if (!/^\d{17,20}$/.test(id)) throw Error('Invalid Voice Channel ID');
@@ -692,7 +718,8 @@ async function joinChannel(channelId) {
   const isVoice = ch ? (typeof ch.isVoiceBased === 'function' ? ch.isVoiceBased() : (typeof ch.isVoice === 'function' ? ch.isVoice() : ['GUILD_VOICE','GUILD_STAGE_VOICE'].includes(ch.type))) : false;
   if (!isVoice || !ch.guild) throw Error('Voice channel unavailable');
   const s = stateFor(ch.guild.id, ch.guild.name);
-  // A user account holds a single voice connection: tear down every other guild first.
+  // A user account holds a single voice connection: tear down every other guild
+  // first, and clear any ghost voice session left on Discord by a previous run.
   for (const [gid, other] of states) {
     if (gid === ch.guild.id) continue;
     other.leaving = true;
@@ -700,6 +727,13 @@ async function joinChannel(channelId) {
     try { other.connection?.destroy(); } catch (_) {}
     states.delete(gid);
   }
+  try {
+    const shard = client.ws && client.ws.shards ? client.ws.shards.first() : null;
+    if (shard) for (const g of client.guilds.cache.values()) {
+      if (g.id === ch.guild.id) continue;
+      try { shard.send({ op: 4, d: { guild_id: g.id, channel_id: null, self_mute: true, self_deaf: true } }); } catch (_) {}
+    }
+  } catch (_) {}
   s.connection?.destroy();
   s.leaving=false;
   const c = joinVoiceChannel({ channelId:id, guildId:ch.guild.id, adapterCreator:ch.guild.voiceAdapterCreator, selfDeaf:true, selfMute:true });
@@ -757,7 +791,7 @@ const active=()=>{ if(lastActiveId&&states.has(lastActiveId)) return states.get(
 for(const [route,cmd] of Object.entries({leave:'leave',play:'play',pause:'pause',resume:'resume',skip:'skip',stop:'stop',queue:'queue',shuffle:'shuffle',loop:'loop',autoplay:'autoplay',volume:'volume','remove-queue-item':'remove'}))app.post(`/api/${route}`,(q,r)=>{try{const s=active();if(!s)return r.json({ok:false,error:'No active player'});const body=q.body||{};const args=cmd==='play'?[String(body.query||'')]:cmd==='volume'?[String(body.volume)]:cmd==='loop'?[String(body.mode||'')].filter(Boolean):cmd==='autoplay'||cmd==='shuffle'?[String(body.state||'')].filter(Boolean):cmd==='remove'?[String(body.index)]:[];send(r,run(s,cmd,args));}catch(e){log('API',e.message);if(!r.headersSent)r.status(200).json({ok:false,error:e.message});}});
 app.use('/api',(q,r)=>r.status(404).json({ok:false,error:'Unknown API endpoint'}));
 app.use((err,q,r,n)=>{log('Web',err.message);if(r.headersSent)return;r.status(400).json({ok:false,error:'Invalid request'});});
-client.once('ready',()=>log('Discord',`Logged in as ${client.user.tag}`));
+client.once('ready',()=>{log('Discord',`Logged in as ${client.user.tag}`);setTimeout(clearStaleVoiceSessions,1500);});
 process.on('unhandledRejection',e=>log('Discord','Unhandled rejection: '+(e&&e.message?e.message:e)));
 process.on('uncaughtException',e=>log('Discord','Uncaught exception: '+(e&&e.message?e.message:e)));
 async function main(){app.listen(PORT,'0.0.0.0',()=>log('Web',`Listening on 0.0.0.0:${PORT}`));if(!process.env.DISCORD_TOKEN){log('Discord','DISCORD_TOKEN missing - web controller only');return;}await client.login(process.env.DISCORD_TOKEN);}
