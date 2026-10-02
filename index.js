@@ -34,7 +34,7 @@ function parseVoiceCommand(text) {
 function stateFor(id, name='') {
   let s = states.get(id);
   if (!s) {
-    s = { guildId:id, guild:name, channelId:'', channel:'', connection:null, player:createAudioPlayer(), queue:[], currentTrack:null, started:0, pausedAt:0, volume:100, loopMode:'off', autoplay:false, shuffle:false, status:'idle', error:'', generation:0, playingGeneration:0, epoch:0, busy:false, pending:null, leaving:false, recent:[] };
+    s = { guildId:id, guild:name, channelId:'', channel:'', connection:null, player:createAudioPlayer(), queue:[], currentTrack:null, started:0, pausedAt:0, volume:100, loopMode:'off', autoplay:false, shuffle:false, status:'idle', error:'', generation:0, playingGeneration:0, epoch:0, busy:false, pending:null, leaving:false, recent:[], recentKeys:[] };
     s.player.on(AudioPlayerStatus.Idle, () => advance(s, s.playingGeneration));
     s.player.on('error', e => { log('Player', e.message); s.error=e.message; s.currentTrack=null; s.generation++; advance(s,s.generation); });
     states.set(id,s);
@@ -251,12 +251,37 @@ async function findYoutubeCandidates(q, n, useCookie) {
   for (const t of tracks) t.cookie = !!useCookie;
   return tracks;
 }
+function trackKey(t) {
+  if (!t) return '';
+  const base = String(t.title || '').toLowerCase()
+    .replace(/\([^)]*\)|\[[^\]]*\]/g, ' ')            // (official video), [4K remaster], etc.
+    .replace(/\b(feat|ft|featuring|with)\b.*$/g, ' ')     // feat. X -> drop
+    .replace(/\b(official|lyric|lyrics|audio|video|visualizer|remaster(ed)?|hd|hq|4k|8k|mv|m\/v|music video|explicit|clean|live|acoustic|version|edit|prod)\b/g, ' ')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim();
+  // Remove every token that belongs to the artist name so "keshi - always" and
+  // "Always" (or the same song under a different uploader) collapse to one key.
+  const artistTokens = new Set(String(t.artist || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim().split(' ').filter(Boolean));
+  const key = base.split(' ').filter(w => w && !artistTokens.has(w)).join(' ');
+  return key.replace(/\s+/g, ' ').trim();
+}
+function pushRecent(s, t) {
+  if (!t) return;
+  if (t.url) { s.recent.unshift(t.url); s.recent = s.recent.slice(0, 20); }
+  const k = trackKey(t);
+  if (k) { s.recentKeys.unshift(k); s.recentKeys = s.recentKeys.slice(0, 20); }
+}
 async function autoplayNext(s, done) {
-  const seen = new Set(s.recent);
-  if (done && done.url) seen.add(done.url);
+  const seenUrls = new Set(s.recent);
+  const seenKeys = new Set(s.recentKeys || []);
+  if (done && done.url) seenUrls.add(done.url);
+  if (done) { const dk = trackKey(done); if (dk) seenKeys.add(dk); }
+  // Never autoplay the same song again (even a different uploader of it).
+  const isNew = t => t && t.url && !seenUrls.has(t.url) && !seenKeys.has(trackKey(t));
+  const blocked = /podcast|interview|tutorial|full album|mix\b|reaction|compilation|1 hour|\d+\s*(hours?|minutes?)/i;
   const queries = [
-    [done && done.artist, done && done.title, 'song'].filter(Boolean).join(' '),
     [done && done.artist, 'official audio'].filter(Boolean).join(' '),
+    [done && done.artist, done && done.title, 'song'].filter(Boolean).join(' '),
     [done && done.artist, done && done.title].filter(Boolean).join(' ')
   ].filter(Boolean);
   for (const q of queries) {
@@ -266,10 +291,18 @@ async function autoplayNext(s, done) {
       if (hasCookie()) { try { cands = await findYoutubeCandidates(q, 10, false); } catch (_) {} }
       if (!cands.length) { log('Player', 'Autoplay search failed (' + q + '): ' + e.message); continue; }
     }
-    const pick = cands.find(t => t.url && !seen.has(t.url) && !/podcast|interview|tutorial|full album|mix\b|reaction/i.test(t.title));
+    // Skip the original artist's own re-uploads: prefer OTHER songs, not the same track.
+    const pick = cands.find(t => isNew(t) && !blocked.test(t.title));
     if (pick) return pick;
-    const fallback = cands.find(t => t.url && !seen.has(t.url));
-    if (fallback) return fallback;
+  }
+  // Nothing new in the artist's own catalogue -> pull something from a related query.
+  const rel = [done && done.artist, 'radio'].filter(Boolean).join(' ');
+  if (rel) {
+    try {
+      const cands = await findYoutubeCandidates(rel, 15, hasCookie());
+      const pick = cands.find(t => isNew(t) && !blocked.test(t.title));
+      if (pick) return pick;
+    } catch (_) {}
   }
   return null;
 }
@@ -513,7 +546,7 @@ function streamFailed(s, g, err) {
     s.queue.unshift({ ...failed, attempt, cookie: useCookie || !!failed.cookie, client });
   } else if (failed && failed.url) {
     log('Player', 'Giving up on "' + (failed.title || failed.url) + '": ' + s.error);
-    s.recent.unshift(failed.url); s.recent = s.recent.slice(0, 20);
+    pushRecent(s, failed);
   }
   setTimeout(() => advance(s, s.generation, false), 0);
 }
@@ -525,7 +558,7 @@ async function advance(s, g, manualSkip) {
   try {
     const done = s.currentTrack;
     if (done) {
-      if (done.url) { s.recent.unshift(done.url); s.recent = s.recent.slice(0, 20); }
+      pushRecent(s, done);
       // Natural end while looping a single track: replay the same track.
       if (!manualSkip && s.loopMode === 'track') { await playCurrent(s, ++s.generation); return; }
       // Loop queue (or a manual skip while looping the queue): keep it in rotation.
@@ -555,7 +588,7 @@ async function advance(s, g, manualSkip) {
           s.queue.unshift({ ...next, attempt, cookie: useCookie || !!next.cookie, client: attempt >= 2 ? 'tv_embedded' : undefined });
         } else {
           log('Player', 'Skipping failed track "' + next.title + '": ' + e.message);
-          if (next.url) { s.recent.unshift(next.url); s.recent = s.recent.slice(0, 20); }
+          pushRecent(s, next);
         }
         s.currentTrack = null;
       }
