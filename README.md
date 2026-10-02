@@ -46,6 +46,7 @@ npm start
 | Variable | Description |
 |---|---|
 | `DISCORD_TOKEN` | Discord user token (required). Keep it in the environment only; never put it in the web UI. |
+| `OWNER_IDS` | Optional. Comma/space separated Discord user IDs allowed to control the bot from any voice channel (or none). Everyone else must be in the bot's voice channel. |
 | `PORT` | Web server port (default 3000, set automatically by Railway) |
 | `SPOTIFY_CLIENT_ID` | Spotify API client ID (optional; falls back to public metadata when unavailable) |
 | `SPOTIFY_CLIENT_SECRET` | Spotify API client secret (optional) |
@@ -103,6 +104,13 @@ ave autoplay off
 ```
 
 Aliases: `p` play, `next`/`s` skip, `disconnect`/`dc` leave, `q` queue, `mix` shuffle, `vol` volume, `continue` resume, `repeat` loop, `connect` join.
+
+### Who can control the bot
+
+- **Same voice channel as the bot** → all commands work.
+- **Different voice channel or not in voice** → commands are ignored, except `avejoin` (summons the bot to your voice channel).
+- **Whitelisted users** (`OWNER_IDS`, comma/space separated user IDs) → can control the bot from any voice channel, or even without being in voice.
+- **No voice session yet** → anyone currently in a voice channel may send `ave play ...`; the bot joins them and starts playback.
 
 ## Railway Deployment
 

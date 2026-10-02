@@ -15,6 +15,10 @@ const log = (tag, message) => console.log(`[${tag}] ${message}`);
 const aliases = { p:'play', next:'skip', s:'skip', disconnect:'leave', dc:'leave', q:'queue', mix:'shuffle', vol:'volume', continue:'resume', repeat:'loop', connect:'join' };
 const CANONICAL = new Set(['play','skip','stop','leave','join','queue','shuffle','remove','pause','resume','volume','loop','autoplay']);
 const KNOWN = new Set([...CANONICAL, ...Object.keys(aliases)]);
+// Users allowed to control the bot even when they are NOT in the bot's voice
+// channel. Comma/space separated Discord user IDs from OWNER_IDS (or WHITELIST_IDS).
+const WHITELIST = new Set(String(process.env.OWNER_IDS || process.env.WHITELIST_IDS || '')
+  .split(/[\s,]+/).map(x => x.trim()).filter(Boolean));
 function parseVoiceCommand(text) {
   const words = String(text || '').toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').trim().split(/\s+/).filter(Boolean);
   for (let i = 0; i < words.length; i++) {
@@ -686,15 +690,31 @@ client.on('messageCreate', async (m) => {
     if (!parsed || !parsed.command) return;
     if (!KNOWN.has(parsed.command)) { log('Command', 'Unknown command: ' + parsed.command); return; }
     const vc = m.member && m.member.voice ? m.member.voice.channel : null;
+    const whitelisted = WHITELIST.has(m.author.id);
+    // avejoin: anyone currently in a voice channel can summon the bot to them.
     if (parsed.command === 'join') {
       if (!vc) { log('Voice', 'join ignored: you are not in a voice channel'); return; }
       await joinChannel(vc.id);
       log('Command', 'join -> ' + vc.name);
       return;
     }
-    let s = m.guildId ? states.get(m.guildId) : null;
-    if (!s && vc) s = await joinChannel(vc.id);
-    if (!s) { log('Command', 'no active player; join a voice channel or use the web controller'); return; }
+    // The bot holds at most one voice connection at a time.
+    const botState = [...states.values()].find(st => st.connection);
+    let s;
+    if (!botState) {
+      // Bot is not in voice yet: anyone in a voice channel may start playback here.
+      if (!vc) { log('Command', 'no active player; join a voice channel first'); return; }
+      s = await joinChannel(vc.id);
+    } else {
+      // Bot is already playing: only users in the SAME voice channel (or whitelisted)
+      // may control it. Everyone else is silently ignored.
+      const sameVoice = !!vc && vc.id === botState.channelId;
+      if (!sameVoice && !whitelisted) {
+        log('Command', 'ignored "' + parsed.command + '" from ' + m.author.id + ': not in the bot\'s voice channel');
+        return;
+      }
+      s = botState;
+    }
     await run(s, parsed.command, parsed.args);
     log('Command', parsed.command + (parsed.args.length ? ' ' + parsed.args.join(' ') : ''));
   } catch (e) { log('Command', e.message); }
