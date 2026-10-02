@@ -131,15 +131,32 @@ function ytdlpCapabilities() {
   log('YouTube', 'yt-dlp capabilities: js-runtimes=' + ytdlpCapsCache.jsRuntimes + ' remote-components=' + ytdlpCapsCache.remoteComponents);
   return ytdlpCapsCache;
 }
+// yt-dlp answers differently per network (residential vs datacenter) and per
+// operation (search vs streaming): on some hosts the web clients 403 on a stream
+// while the mobile clients work, and the mobile clients get "Sign in to confirm
+// you're not a bot" on a search. So instead of hardcoding one client we keep a
+// ladder per operation and walk it until one works. Override via env if YouTube
+// changes again: YTDLP_SEARCH_CLIENTS / YTDLP_STREAM_CLIENTS (comma/space list).
+function envList(name, fallback, prepend) {
+  // Unset or blank -> use the built-in ladder. Explicit off/none/false/0 -> let
+  // yt-dlp choose its own default client (empty list). Otherwise parse the list.
+  const v = process.env[name];
+  const t = v === undefined ? '' : String(v).trim();
+  let list = !t ? fallback.slice()
+    : (['off', 'none', 'false', '0'].includes(t.toLowerCase()) ? [] : t.split(/[\s,]+/).filter(Boolean));
+  if (prepend) list = [prepend, ...list];
+  return list.filter((c, i, a) => c !== '' && a.indexOf(c) === i);
+}
+// Legacy single-client override, kept working as the first rung of both ladders.
+const LEGACY_CLIENT = (process.env.YTDLP_PLAYER_CLIENT || '').trim();
+const SEARCH_CLIENTS = envList('YTDLP_SEARCH_CLIENTS', ['default', 'web_embedded', 'mweb', 'android'], LEGACY_CLIENT);
+const STREAM_CLIENTS = envList('YTDLP_STREAM_CLIENTS', ['android', 'mweb', 'default'], LEGACY_CLIENT);
 function ytdlpArgs(extra = [], allowPlaylist = false, useCookie = false, client) {
   const args = ['--no-warnings', '--socket-timeout', '15'];
   if (!allowPlaylist) args.push('--no-playlist');
-  // With a logged-in cookie, YouTube answers HTTP 403 for the web clients
-  // (default / web_embedded) on every stream, but the android and mweb clients
-  // work reliably. Without a cookie the web clients still work, so keep android
-  // as the default and let the env override it if YouTube changes again.
-  const pc = client || process.env.YTDLP_PLAYER_CLIENT || 'android';
-  if (pc) args.push('--extractor-args', 'youtube:player_client=' + pc);
+  // The caller selects the client from SEARCH_CLIENTS / STREAM_CLIENTS; when it
+  // passes nothing we let yt-dlp pick its own default.
+  if (client) args.push('--extractor-args', 'youtube:player_client=' + client);
   // YouTube requires solving the signature/n challenge before googlevideo URLs are
   // usable. Without a JS runtime yt-dlp cannot solve it, so the CDN answers HTTP
   // 403 ("unable to download video data") or YouTube asks to confirm you are not
@@ -157,7 +174,7 @@ function ytdlpJson(input, opts = {}) {
   const { cmd, pre } = resolveYtdlp();
   const extra = ['--dump-single-json', '--skip-download'].concat(opts.extra || []);
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, [...pre, ...ytdlpArgs(extra, !!opts.playlist, !!opts.cookie), input], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(cmd, [...pre, ...ytdlpArgs(extra, !!opts.playlist, !!opts.cookie, opts.client), input], { stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '', err = '';
     child.stdout.on('data', d => out += d);
     child.stderr.on('data', d => err += d);
@@ -217,15 +234,17 @@ function safeUrl(value) {
 async function findYoutube(q, useCookie) {
   const isUrl = /^https?:/i.test(q);
   const input = isUrl ? q : `ytsearch1:${q}`;
-  const attempts = isUrl ? 1 : 3;
+  // A URL is extracted directly; a search walks the client ladder because YouTube
+  // may reject one search client while accepting another on this network.
+  const clients = isUrl ? [undefined] : SEARCH_CLIENTS;
   let v = null, lastErr = null;
-  for (let i = 0; i < attempts && !v; i++) {
+  for (let i = 0; i < clients.length && !v; i++) {
     try {
-      const info = await ytdlpJson(input, { cookie: useCookie });
+      const info = await ytdlpJson(input, { cookie: useCookie, client: clients[i] });
       const cand = info.entries ? info.entries[0] : info;
       if (cand && cand.webpage_url) v = cand;
-    } catch (e) { lastErr = e; log('YouTube', 'Search attempt ' + (i + 1) + ' failed: ' + e.message); }
-    if (!v && i < attempts - 1) await new Promise(r => setTimeout(r, 800));
+    } catch (e) { lastErr = e; log('YouTube', 'Search attempt ' + (i + 1) + '/' + clients.length + (clients[i] ? ' (' + clients[i] + ')' : '') + ' failed: ' + e.message); }
+    if (!v && i < clients.length - 1) await new Promise(r => setTimeout(r, 600));
   }
   if (!v) throw Error(lastErr ? lastErr.message : 'No YouTube result');
   const t = toTrack(v);
@@ -255,7 +274,7 @@ async function resolveYoutube(q) {
   }
 }
 async function findYoutubeCandidates(q, n, useCookie) {
-  const info = await ytdlpJson(`ytsearch${n}:${q}`, { playlist: true, extra: ['--flat-playlist'], cookie: useCookie });
+  const info = await ytdlpJson(`ytsearch${n}:${q}`, { playlist: true, extra: ['--flat-playlist'], cookie: useCookie, client: SEARCH_CLIENTS[0] });
   const entries = (info.entries || []).filter(Boolean);
   const tracks = entries.map(e => toTrack(e)).filter(t => t.url);
   for (const t of tracks) t.cookie = !!useCookie;
@@ -355,7 +374,7 @@ async function spotifyMeta(url) {
       const parts = raw.split(' - ');
       const artist = parts.length > 1 ? parts[0] : '';
       const track = parts.length > 1 ? parts.slice(1).join(' - ') : raw;
-      const info = await ytdlpJson('ytsearch1:' + (artist + ' ' + track).trim(), { cookie: hasCookie() });
+      const info = await ytdlpJson('ytsearch1:' + (artist + ' ' + track).trim(), { cookie: hasCookie(), client: SEARCH_CLIENTS[0] });
       const v = info.entries ? info.entries[0] : info;
       return { title: track, artist: artist, duration: Number((v && v.duration) || 0) * 1000, thumbnail: j.thumbnail_url || (v && v.thumbnail) || '' };
     } catch (_) { return null; }
@@ -537,7 +556,7 @@ async function playCurrent(s, g) {
     const r = await fetch(safeUrl(t.url), { redirect: 'error' });
     if (!r.ok || !r.body || !(r.headers.get('content-type') || '').startsWith('audio/')) throw Error('Audio URL unavailable');
     source = Readable.fromWeb(r.body);
-  } else source = ytdlpStream(t.url, t.cookie, t.client);
+  } else source = ytdlpStream(t.url, t.cookie, t.client || STREAM_CLIENTS[0]);
   source.on('error', e => { if (g === s.generation) { log('Player', e.message); streamFailed(s, g, e); } });
   const resource = createAudioResource(toPcm(source), { inputType: StreamType.Raw, inlineVolume: true });
   if (resource.volume) resource.volume.setVolume(s.volume / 100);
@@ -560,7 +579,7 @@ function streamFailed(s, g, err) {
   if (ytdlpTrack && (failed.attempt || 0) < 2) {
     const attempt = (failed.attempt || 0) + 1;
     const useCookie = hasCookie() && !failed.cookie;
-    const client = useCookie ? undefined : (attempt === 1 ? 'mweb' : 'android');
+    const client = STREAM_CLIENTS[Math.min(attempt, STREAM_CLIENTS.length - 1)];
     log('YouTube', 'Stream failed (' + s.error + '); retry ' + attempt + (useCookie ? ' with cookie' : ' with client ' + client));
     s.queue.unshift({ ...failed, attempt, cookie: useCookie || !!failed.cookie, client });
   } else if (failed && failed.url) {
@@ -603,8 +622,9 @@ async function advance(s, g, manualSkip) {
         if (next.url && next.platform !== 'direct' && (next.attempt || 0) < 2) {
           const attempt = (next.attempt || 0) + 1;
           const useCookie = attempt === 1 && hasCookie() && !next.cookie;
-          log('YouTube', 'Track failed (' + e.message + '); retry ' + attempt + (useCookie ? ' with cookie' : ' with alternate client'));
-          s.queue.unshift({ ...next, attempt, cookie: useCookie || !!next.cookie, client: attempt >= 2 ? 'mweb' : undefined });
+          const client = STREAM_CLIENTS[Math.min(attempt, STREAM_CLIENTS.length - 1)];
+          log('YouTube', 'Track failed (' + e.message + '); retry ' + attempt + (useCookie ? ' with cookie' : ' with client ' + client));
+          s.queue.unshift({ ...next, attempt, cookie: useCookie || !!next.cookie, client });
         } else {
           log('Player', 'Skipping failed track "' + next.title + '": ' + e.message);
           pushRecent(s, next);
