@@ -150,7 +150,23 @@ function envList(name, fallback, prepend) {
 // Legacy single-client override, kept working as the first rung of both ladders.
 const LEGACY_CLIENT = (process.env.YTDLP_PLAYER_CLIENT || '').trim();
 const SEARCH_CLIENTS = envList('YTDLP_SEARCH_CLIENTS', ['default', 'web_embedded', 'mweb', 'android'], LEGACY_CLIENT);
-const STREAM_CLIENTS = envList('YTDLP_STREAM_CLIENTS', ['android', 'mweb', 'default'], LEGACY_CLIENT);
+const STREAM_CLIENTS = envList('YTDLP_STREAM_CLIENTS', ['android', 'mweb', 'web_safari', 'tv', 'default'], LEGACY_CLIENT);
+// Datacenter IPs (Railway, VPS) are frequently blocked by YouTube for the video
+// page fetch that streaming requires. A residential/rotating proxy fixes it; set
+// YTDLP_PROXY to any yt-dlp proxy URL, e.g. http://user:pass@host:port or
+// socks5://host:port. Left unset, yt-dlp connects directly.
+const YTDLP_PROXY = (process.env.YTDLP_PROXY || '').trim();
+// Ordered (cookie, client) combinations used to open an audio stream. YouTube may
+// reject a stream for one combination and accept another, so a failed track is
+// retried down the whole list before it is dropped. Cookie combinations are tried
+// first when a cookie is configured, then the anonymous ones.
+function streamPlan() {
+  const clients = STREAM_CLIENTS.length ? STREAM_CLIENTS : [undefined];
+  const combos = [];
+  if (hasCookie()) for (const c of clients) combos.push({ cookie: true, client: c });
+  for (const c of clients) combos.push({ cookie: false, client: c });
+  return combos;
+}
 function ytdlpArgs(extra = [], allowPlaylist = false, useCookie = false, client) {
   const args = ['--no-warnings', '--socket-timeout', '15'];
   if (!allowPlaylist) args.push('--no-playlist');
@@ -167,6 +183,7 @@ function ytdlpArgs(extra = [], allowPlaylist = false, useCookie = false, client)
   const rc = envChoice('YTDLP_REMOTE_COMPONENTS', 'ejs:github');
   if (caps.remoteComponents && rc) args.push('--remote-components', rc);
   if (useCookie) { const ck = cookieFile(); if (ck) args.push('--cookies', ck); }
+  if (YTDLP_PROXY) args.push('--proxy', YTDLP_PROXY);
   return args.concat(extra);
 }
 function hasCookie() { return !!cookieFile(); }
@@ -540,23 +557,37 @@ async function resolveOne(q) {
     if (!/\.(mp3|ogg|opus|wav|m4a|aac|flac)(\?|$)/i.test(u.pathname + u.search)) throw Error('URL must point to audio');
     return { title: path.basename(u.pathname), artist: u.hostname, url: u.href, duration: 0, thumbnail: '', platform: 'direct' };
   }
-// Parallel race: yt-dlp (cookie+anon) vs Spotify/Deezer metadata → YT search.
-  // First to resolve wins; losers are discarded silently.
-  const tasks = [];
-  tasks.push(findYoutube(q, hasCookie()).catch(() => null));
-  if (!hasCookie()) tasks.push(findYoutube(q, false).catch(() => null));
-  tasks.push((async () => {
-    const fb = (await spotifySearch(q)) || (await deezerSearch(q));
-    if (!fb) return null;
-    const retry = [fb.artist, fb.title].filter(Boolean).join(' ') || q;
-    try {
-      const t = await findYoutube(retry, hasCookie());
-      return { ...t, title: fb.title || t.title, artist: fb.artist || t.artist, platform: 'spotify' };
-    } catch (_) { return null; }
-  })());
-  const race = tasks.map(t => Promise.resolve(t).then(r => { if (!r) throw new Error('skip'); return r; }));
-  const winner = await Promise.any(race).catch(() => null)
-    || await Promise.all(tasks.map(t => Promise.resolve(t).catch(() => null))).then(rs => rs.find(Boolean) || null);
+  // Every source is queried at the same time and the first playable track wins;
+  // the rest are discarded. Spotify and Deezer only supply metadata, so they
+  // still end in a YouTube search, but running all four in parallel means the
+  // fastest route wins and a source that is down (Spotify needs a premium app)
+  // can never delay playback.
+  const sources = [
+    { name: 'yt-dlp search (cookie)', run: () => findYoutube(q, true) },
+    { name: 'yt-dlp search (anon)', run: () => findYoutube(q, false) },
+    { name: 'Deezer -> YouTube', run: async () => {
+        const fb = await deezerSearch(q);
+        if (!fb) return null;
+        const retry = [fb.artist, fb.title].filter(Boolean).join(' ') || q;
+        const t = await findYoutube(retry, hasCookie());
+        return { ...t, title: fb.title || t.title, artist: fb.artist || t.artist, platform: 'deezer' };
+      } },
+    { name: 'Spotify -> YouTube', run: async () => {
+        const fb = await spotifySearch(q);
+        if (!fb) return null;
+        const retry = [fb.artist, fb.title].filter(Boolean).join(' ') || q;
+        const t = await findYoutube(retry, hasCookie());
+        return { ...t, title: fb.title || t.title, artist: fb.artist || t.artist, platform: 'spotify' };
+      } }
+  ];
+  const pending = sources.map(src => Promise.resolve()
+    .then(src.run)
+    .then(
+      t => { if (t) log('API', src.name + ' resolved "' + (t.title || q) + '"'); return t; },
+      e => { log('API', src.name + ' failed: ' + e.message); return null; }
+    ));
+  const winner = await Promise.any(pending.map(p => p.then(t => { if (!t) throw new Error('skip'); return t; }))).catch(() => null)
+    || (await Promise.all(pending)).find(Boolean) || null;
   if (winner) return winner;
   throw Error('No result from any source');
 }
@@ -580,7 +611,11 @@ async function playCurrent(s, g) {
     const r = await fetch(safeUrl(t.url), { redirect: 'error' });
     if (!r.ok || !r.body || !(r.headers.get('content-type') || '').startsWith('audio/')) throw Error('Audio URL unavailable');
     source = Readable.fromWeb(r.body);
-  } else source = ytdlpStream(t.url, t.cookie, t.client || STREAM_CLIENTS[0]);
+  } else {
+    const plan = streamPlan();
+    const combo = plan[Math.min(t.planIndex || 0, plan.length - 1)] || { cookie: !!t.cookie, client: t.client };
+    source = ytdlpStream(t.url, combo.cookie, combo.client);
+  }
   source.on('error', e => { if (g === s.generation) { log('Player', e.message); streamFailed(s, g, e); } });
   const resource = createAudioResource(toPcm(source), { inputType: StreamType.Raw, inlineVolume: true });
   if (resource.volume) resource.volume.setVolume(s.volume / 100);
@@ -600,12 +635,12 @@ function streamFailed(s, g, err) {
   s.status = 'idle'; s.started = 0;
   try { s.player.stop(true); } catch (_) {}
   const ytdlpTrack = failed && failed.url && failed.platform !== 'direct';
-  if (ytdlpTrack && (failed.attempt || 0) < 2) {
+  const plan = streamPlan();
+  if (ytdlpTrack && (failed.attempt || 0) < plan.length - 1) {
     const attempt = (failed.attempt || 0) + 1;
-    const useCookie = hasCookie() && !failed.cookie;
-    const client = STREAM_CLIENTS[Math.min(attempt, STREAM_CLIENTS.length - 1)];
-    log('YouTube', 'Stream failed (' + s.error + '); retry ' + attempt + (useCookie ? ' with cookie' : ' with client ' + client));
-    s.queue.unshift({ ...failed, attempt, cookie: useCookie || !!failed.cookie, client });
+    const combo = plan[attempt];
+    log('YouTube', 'Stream failed (' + s.error + '); retry ' + attempt + '/' + (plan.length - 1) + ' [' + (combo.cookie ? 'cookie' : 'anon') + (combo.client ? ' ' + combo.client : '') + ']');
+    s.queue.unshift({ ...failed, attempt, planIndex: attempt, cookie: combo.cookie, client: combo.client });
   } else if (failed && failed.url) {
     log('Player', 'Giving up on "' + (failed.title || failed.url) + '": ' + s.error);
     pushRecent(s, failed);
@@ -643,12 +678,12 @@ async function advance(s, g, manualSkip) {
       try { await playCurrent(s, ++s.generation); return; }
       catch (e) {
         s.error = e.message;
-        if (next.url && next.platform !== 'direct' && (next.attempt || 0) < 2) {
+        const plan = streamPlan();
+        if (next.url && next.platform !== 'direct' && (next.attempt || 0) < plan.length - 1) {
           const attempt = (next.attempt || 0) + 1;
-          const useCookie = attempt === 1 && hasCookie() && !next.cookie;
-          const client = STREAM_CLIENTS[Math.min(attempt, STREAM_CLIENTS.length - 1)];
-          log('YouTube', 'Track failed (' + e.message + '); retry ' + attempt + (useCookie ? ' with cookie' : ' with client ' + client));
-          s.queue.unshift({ ...next, attempt, cookie: useCookie || !!next.cookie, client });
+          const combo = plan[attempt];
+          log('YouTube', 'Track failed (' + e.message + '); retry ' + attempt + '/' + (plan.length - 1) + ' [' + (combo.cookie ? 'cookie' : 'anon') + (combo.client ? ' ' + combo.client : '') + ']');
+          s.queue.unshift({ ...next, attempt, planIndex: attempt, cookie: combo.cookie, client: combo.client });
         } else {
           log('Player', 'Skipping failed track "' + next.title + '": ' + e.message);
           pushRecent(s, next);
