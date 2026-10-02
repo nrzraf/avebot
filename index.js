@@ -134,10 +134,11 @@ function ytdlpCapabilities() {
 function ytdlpArgs(extra = [], allowPlaylist = false, useCookie = false, client) {
   const args = ['--no-warnings', '--socket-timeout', '15'];
   if (!allowPlaylist) args.push('--no-playlist');
-  // Newer yt-dlp defaults logged-in requests to the "tv_downgraded" client, which
-  // YouTube currently rejects with "The page needs to be reloaded" (yt-dlp #17389).
-  // Forcing default+web_embedded works with and without cookies.
-  const pc = client || process.env.YTDLP_PLAYER_CLIENT || 'default,web_embedded';
+  // With a logged-in cookie, YouTube answers HTTP 403 for the web clients
+  // (default / web_embedded) on every stream, but the android and mweb clients
+  // work reliably. Without a cookie the web clients still work, so keep android
+  // as the default and let the env override it if YouTube changes again.
+  const pc = client || process.env.YTDLP_PLAYER_CLIENT || 'android';
   if (pc) args.push('--extractor-args', 'youtube:player_client=' + pc);
   // YouTube requires solving the signature/n challenge before googlevideo URLs are
   // usable. Without a JS runtime yt-dlp cannot solve it, so the CDN answers HTTP
@@ -559,7 +560,7 @@ function streamFailed(s, g, err) {
   if (ytdlpTrack && (failed.attempt || 0) < 2) {
     const attempt = (failed.attempt || 0) + 1;
     const useCookie = hasCookie() && !failed.cookie;
-    const client = useCookie ? undefined : (attempt === 1 ? 'tv_embedded' : 'web_safari');
+    const client = useCookie ? undefined : (attempt === 1 ? 'mweb' : 'android');
     log('YouTube', 'Stream failed (' + s.error + '); retry ' + attempt + (useCookie ? ' with cookie' : ' with client ' + client));
     s.queue.unshift({ ...failed, attempt, cookie: useCookie || !!failed.cookie, client });
   } else if (failed && failed.url) {
@@ -603,7 +604,7 @@ async function advance(s, g, manualSkip) {
           const attempt = (next.attempt || 0) + 1;
           const useCookie = attempt === 1 && hasCookie() && !next.cookie;
           log('YouTube', 'Track failed (' + e.message + '); retry ' + attempt + (useCookie ? ' with cookie' : ' with alternate client'));
-          s.queue.unshift({ ...next, attempt, cookie: useCookie || !!next.cookie, client: attempt >= 2 ? 'tv_embedded' : undefined });
+          s.queue.unshift({ ...next, attempt, cookie: useCookie || !!next.cookie, client: attempt >= 2 ? 'mweb' : undefined });
         } else {
           log('Player', 'Skipping failed track "' + next.title + '": ' + e.message);
           pushRecent(s, next);
@@ -681,6 +682,14 @@ async function run(s, cmd, args = []) {
 const client=new Client({ checkUpdate: false });
 // Text control channel: type commands with the "ave" prefix in any text channel
 // AveBot can read (e.g. "ave play laufey promise", "avejoin", "ave skip").
+// A voice session counts as "in use" while it is playing/loading/paused or has
+// queued tracks. An idle connection is not in use, so others may pull the bot.
+function isBotBusy(s) {
+  if (!s || !s.connection) return false;
+  if (s.currentTrack) return true;
+  if (s.status === 'playing' || s.status === 'paused' || s.status === 'loading') return true;
+  return !!(s.queue && s.queue.length);
+}
 // AveBot NEVER replies, reacts, or sends anything back to Discord.
 client.on('messageCreate', async (m) => {
   try {
@@ -691,15 +700,22 @@ client.on('messageCreate', async (m) => {
     if (!KNOWN.has(parsed.command)) { log('Command', 'Unknown command: ' + parsed.command); return; }
     const vc = m.member && m.member.voice ? m.member.voice.channel : null;
     const whitelisted = WHITELIST.has(m.author.id);
-    // avejoin: anyone currently in a voice channel can summon the bot to them.
+    // The bot holds at most one voice connection at a time.
+    const botState = [...states.values()].find(st => st.connection);
+    const sameVoice = !!vc && !!botState && vc.id === botState.channelId;
+    // avejoin: allowed when the bot is free (not connected, or connected but idle),
+    // when you are already in its channel, or when you are whitelisted. A bot that is
+    // actively in use in another channel will NOT be pulled away by non-whitelisted users.
     if (parsed.command === 'join') {
       if (!vc) { log('Voice', 'join ignored: you are not in a voice channel'); return; }
+      if (botState && !sameVoice && isBotBusy(botState) && !whitelisted) {
+        log('Voice', 'join ignored for ' + m.author.id + ': bot is in use in "' + (botState.channel || botState.channelId) + '"');
+        return;
+      }
       await joinChannel(vc.id);
       log('Command', 'join -> ' + vc.name);
       return;
     }
-    // The bot holds at most one voice connection at a time.
-    const botState = [...states.values()].find(st => st.connection);
     let s;
     if (!botState) {
       // Bot is not in voice yet: anyone in a voice channel may start playback here.
@@ -708,7 +724,6 @@ client.on('messageCreate', async (m) => {
     } else {
       // Bot is already playing: only users in the SAME voice channel (or whitelisted)
       // may control it. Everyone else is silently ignored.
-      const sameVoice = !!vc && vc.id === botState.channelId;
       if (!sameVoice && !whitelisted) {
         log('Command', 'ignored "' + parsed.command + '" from ' + m.author.id + ': not in the bot\'s voice channel');
         return;
