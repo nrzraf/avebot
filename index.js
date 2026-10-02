@@ -234,51 +234,75 @@ function safeUrl(value) {
 async function findYoutube(q, useCookie) {
   const isUrl = /^https?:/i.test(q);
   const input = isUrl ? q : `ytsearch1:${q}`;
-  // A URL is extracted directly; a search walks the client ladder because YouTube
-  // may reject one search client while accepting another on this network.
+  // A search is read with --flat-playlist: yt-dlp takes the metadata straight
+  // from the result page and never opens the individual video page, which is the
+  // step YouTube blocks with "Sign in to confirm you're not a bot" from
+  // datacenter IPs (Railway, VPS). The flat result still carries id, title,
+  // uploader, duration and watch URL, so nothing is lost. A plain URL is
+  // extracted normally, with flat metadata as a fallback if that page is blocked.
+  // Either way we walk the client ladder because YouTube may accept one client
+  // and reject another on a given network.
   const clients = isUrl ? [undefined] : SEARCH_CLIENTS;
-  let v = null, lastErr = null;
-  for (let i = 0; i < clients.length && !v; i++) {
-    try {
-      const info = await ytdlpJson(input, { cookie: useCookie, client: clients[i] });
-      const cand = info.entries ? info.entries[0] : info;
-      if (cand && cand.webpage_url) v = cand;
-    } catch (e) { lastErr = e; log('YouTube', 'Search attempt ' + (i + 1) + '/' + clients.length + (clients[i] ? ' (' + clients[i] + ')' : '') + ' failed: ' + e.message); }
-    if (!v && i < clients.length - 1) await new Promise(r => setTimeout(r, 600));
+  const modes = isUrl ? [[], ['--flat-playlist']] : [['--flat-playlist']];
+  // Try the requested cookie setting first, then the opposite one: a stale or
+  // flagged cookie can itself trigger "Sign in to confirm you're not a bot",
+  // so an anonymous request sometimes succeeds where the cookie one does not.
+  const cookieModes = useCookie ? [true, false] : [false];
+  const total = clients.length * modes.length * cookieModes.length;
+  let v = null, lastErr = null, n = 0, found = useCookie;
+  for (const ck of cookieModes) {
+    for (let i = 0; i < clients.length && !v; i++) {
+      for (const extra of modes) {
+        n++;
+        try {
+          const info = await ytdlpJson(input, { cookie: ck, client: clients[i], extra });
+          const cand = info.entries ? info.entries[0] : info;
+          if (cand && (cand.webpage_url || cand.url || cand.id)) { v = cand; found = ck; break; }
+        } catch (e) {
+          lastErr = e;
+          log('YouTube', 'Search attempt ' + n + '/' + total + (clients[i] ? ' (' + clients[i] + ')' : '') + (extra.length ? ' [flat]' : '') + (ck ? ' [cookie]' : ' [anon]') + ' failed: ' + e.message);
+        }
+        if (!v) await new Promise(r => setTimeout(r, 400));
+      }
+    }
   }
   if (!v) throw Error(lastErr ? lastErr.message : 'No YouTube result');
   const t = toTrack(v);
-  t.cookie = !!useCookie;
+  t.cookie = !!found;
   return t;
 }
 function toTrack(v) {
-  const id = v.id || (v.webpage_url && (v.webpage_url.match(/[?&]v=([\w-]+)/) || [])[1]);
+  const wu = v.webpage_url || v.url || '';
+  const id = v.id || (wu.match(/[?&]v=([\w-]+)/) || [])[1];
   return {
     title: v.title || 'Unknown',
     artist: v.uploader || v.channel || 'Unknown',
-    url: v.webpage_url || (id ? 'https://www.youtube.com/watch?v=' + id : ''),
+    url: v.webpage_url || v.url || (id ? 'https://www.youtube.com/watch?v=' + id : ''),
     duration: Number(v.duration || 0) * 1000,
-    thumbnail: v.thumbnail || (id ? 'https://i.ytimg.com/vi/' + id + '/mqdefault.jpg' : ''),
+    thumbnail: v.thumbnail || (v.thumbnails && v.thumbnails.length ? v.thumbnails[v.thumbnails.length - 1].url : '') || (id ? 'https://i.ytimg.com/vi/' + id + '/mqdefault.jpg' : ''),
     platform: 'youtube'
   };
 }
-// Resolve a YouTube URL or search. When YOUTUBE_COOKIE is configured we go
-// straight to the cookie-authenticated request and only fall back to the
-// anonymous request if that fails (never the other way around).
+// Resolve a YouTube URL or search. findYoutube walks both the client ladder and
+// the cookie/anonymous modes, so a single call is enough.
 async function resolveYoutube(q) {
-  if (!hasCookie()) return findYoutube(q, false);
-  try { return await findYoutube(q, true); }
-  catch (e) {
-    log('YouTube', 'Cookie attempt failed (' + e.message + '); retrying without cookie');
-    return findYoutube(q, false);
-  }
+  return findYoutube(q, hasCookie());
 }
 async function findYoutubeCandidates(q, n, useCookie) {
-  const info = await ytdlpJson(`ytsearch${n}:${q}`, { playlist: true, extra: ['--flat-playlist'], cookie: useCookie, client: SEARCH_CLIENTS[0] });
-  const entries = (info.entries || []).filter(Boolean);
-  const tracks = entries.map(e => toTrack(e)).filter(t => t.url);
-  for (const t of tracks) t.cookie = !!useCookie;
-  return tracks;
+  // Walk the search ladder and both cookie modes: one client may be rejected
+  // while another works, and a stale cookie can itself trigger the bot check.
+  let info = null, lastErr = null;
+  const cookieModes = useCookie ? [true, false] : [false];
+  for (const ck of cookieModes) {
+    for (const client of SEARCH_CLIENTS) {
+      try {
+        info = await ytdlpJson(`ytsearch${n}:${q}`, { playlist: true, extra: ['--flat-playlist'], cookie: ck, client });
+        if (info && (info.entries || []).length) return (info.entries || []).filter(Boolean).map(e => toTrack(e)).filter(t => t.url).map(t => (t.cookie = !!ck, t));
+      } catch (e) { lastErr = e; }
+    }
+  }
+  if (!info) throw (lastErr || Error('No candidates'));
+  return [];
 }
 function trackKey(t) {
   if (!t) return '';
@@ -374,7 +398,7 @@ async function spotifyMeta(url) {
       const parts = raw.split(' - ');
       const artist = parts.length > 1 ? parts[0] : '';
       const track = parts.length > 1 ? parts.slice(1).join(' - ') : raw;
-      const info = await ytdlpJson('ytsearch1:' + (artist + ' ' + track).trim(), { cookie: hasCookie(), client: SEARCH_CLIENTS[0] });
+      const info = await ytdlpJson('ytsearch1:' + (artist + ' ' + track).trim(), { cookie: hasCookie(), client: SEARCH_CLIENTS[0], extra: ['--flat-playlist'] });
       const v = info.entries ? info.entries[0] : info;
       return { title: track, artist: artist, duration: Number((v && v.duration) || 0) * 1000, thumbnail: j.thumbnail_url || (v && v.thumbnail) || '' };
     } catch (_) { return null; }
