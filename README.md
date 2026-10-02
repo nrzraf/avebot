@@ -9,10 +9,11 @@ Discord music bot controlled from a web dashboard and Discord text commands.
 - Web dashboard to join/leave voice, play, and control the player
 - Text commands with the prefix `ave` in any Discord text channel AveBot can read
 - Silent `avejoin` trigger: type `avejoin` (or `ave join`) while you are in a voice channel and AveBot joins you
-- YouTube playback via yt-dlp (search + URL), Spotify track resolution (with public-metadata fallback), direct audio links
-- Resolution order for a text query: yt-dlp (no cookie) -> Spotify/Deezer metadata -> yt-dlp (with cookie) -> 30s preview stream
-- Resolution order for a YouTube URL: yt-dlp (no cookie) -> yt-dlp (with cookie)
-- Resolution order for a Spotify URL: Spotify metadata -> yt-dlp (no cookie) -> yt-dlp (with cookie) -> preview stream
+- YouTube playback via yt-dlp (search + URL), Spotify track resolution (Web API or oembed fallback), direct audio links
+- Resolution order for a text query: yt-dlp (cookie first) and Spotify/Deezer metadata race in parallel; the first result wins
+- Resolution order for a YouTube URL: yt-dlp (cookie first), then an anonymous retry
+- Resolution order for a Spotify URL: Spotify Web API or public oembed metadata -> yt-dlp (cookie first) search on YouTube
+- yt-dlp runs with a JavaScript runtime and the EJS challenge solver, which fixes YouTube HTTP 403 / "Sign in to confirm you are not a bot" on datacenter IPs
 - YouTube and Spotify playlists (up to 50 tracks per playlist) are queued automatically
 - A track that fails to resolve or stream is skipped automatically so playback keeps going
 - Queue, shuffle, loop (off/track/queue), autoplay
@@ -22,7 +23,7 @@ Discord music bot controlled from a web dashboard and Discord text commands.
 
 ## Requirements
 
-- Node.js 18 or newer
+- Node.js 20 or newer
 - `yt-dlp` on PATH (or `python -m yt_dlp` available, or set `YTDLP_PATH`)
 - `ffmpeg` on PATH (the bundled `ffmpeg-static` is used automatically when present)
 
@@ -50,7 +51,9 @@ npm start
 | `SPOTIFY_CLIENT_SECRET` | Spotify API client secret (optional) |
 | `YTDLP_PATH` | Custom yt-dlp binary path (optional) |
 | `YTDLP_PLAYER_CLIENT` | Override the yt-dlp YouTube player client (optional; default `default,web_embedded`) |
-| `YOUTUBE_COOKIE` | Optional YouTube cookie (JSON export or raw `name=value; ...` header). Used only as a fallback when yt-dlp without cookies fails. |
+| `YTDLP_JS_RUNTIME` | JavaScript runtime yt-dlp uses to solve YouTube signature/n challenges (default `node`; set to `off` to disable) |
+| `YTDLP_REMOTE_COMPONENTS` | Remote EJS challenge solver component (default `ejs:github`; set to `off` to disable) |
+| `YOUTUBE_COOKIE` | YouTube cookie (JSON export or raw `name=value; ...` header). Strongly recommended on Railway: AveBot uses it first and only falls back to an anonymous request when it is missing or fails. |
 
 ## Discord Setup
 

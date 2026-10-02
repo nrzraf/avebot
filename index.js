@@ -5,7 +5,7 @@ const path = require('path');
 const { Readable } = require('stream');
 const { Client } = require('discord.js-selfbot-v13');
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus, entersState, StreamType } = require('@discordjs/voice');
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const os = require('os');
 const fs = require('fs');
 const app = express(), PORT = Number(process.env.PORT) || 3000, states = new Map();
@@ -102,6 +102,26 @@ function cookieFile() {
   } catch (e) { log('YouTube', `Invalid YOUTUBE_COOKIE: ${e.message}`); }
   return cookieFilePath;
 }
+function envChoice(name, fallback) {
+  const v = process.env[name];
+  if (v === undefined) return fallback;
+  const t = String(v).trim();
+  if (!t || ['off', 'none', 'false', '0'].includes(t.toLowerCase())) return '';
+  return t;
+}
+let ytdlpCapsCache = null;
+function ytdlpCapabilities() {
+  if (ytdlpCapsCache) return ytdlpCapsCache;
+  ytdlpCapsCache = { jsRuntimes: true, remoteComponents: true };
+  try {
+    const { cmd, pre } = resolveYtdlp();
+    const help = execFileSync(cmd, [...pre, '--help'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 20000 });
+    ytdlpCapsCache.jsRuntimes = /--js-runtimes/.test(help);
+    ytdlpCapsCache.remoteComponents = /--remote-components/.test(help);
+  } catch (_) {}
+  log('YouTube', 'yt-dlp capabilities: js-runtimes=' + ytdlpCapsCache.jsRuntimes + ' remote-components=' + ytdlpCapsCache.remoteComponents);
+  return ytdlpCapsCache;
+}
 function ytdlpArgs(extra = [], allowPlaylist = false, useCookie = false, client) {
   const args = ['--no-warnings', '--socket-timeout', '15'];
   if (!allowPlaylist) args.push('--no-playlist');
@@ -110,6 +130,15 @@ function ytdlpArgs(extra = [], allowPlaylist = false, useCookie = false, client)
   // Forcing default+web_embedded works with and without cookies.
   const pc = client || process.env.YTDLP_PLAYER_CLIENT || 'default,web_embedded';
   if (pc) args.push('--extractor-args', 'youtube:player_client=' + pc);
+  // YouTube requires solving the signature/n challenge before googlevideo URLs are
+  // usable. Without a JS runtime yt-dlp cannot solve it, so the CDN answers HTTP
+  // 403 ("unable to download video data") or YouTube asks to confirm you are not
+  // a bot. Enable the Node runtime plus the remote EJS challenge solver.
+  const caps = ytdlpCapabilities();
+  const jsRuntime = envChoice('YTDLP_JS_RUNTIME', 'node');
+  if (caps.jsRuntimes && jsRuntime) args.push('--js-runtimes', jsRuntime);
+  const rc = envChoice('YTDLP_REMOTE_COMPONENTS', 'ejs:github');
+  if (caps.remoteComponents && rc) args.push('--remote-components', rc);
   if (useCookie) { const ck = cookieFile(); if (ck) args.push('--cookies', ck); }
   return args.concat(extra);
 }
@@ -204,13 +233,15 @@ function toTrack(v) {
     platform: 'youtube'
   };
 }
-// Resolve a YouTube URL or search: yt-dlp without cookies first, then with cookies.
+// Resolve a YouTube URL or search. When YOUTUBE_COOKIE is configured we go
+// straight to the cookie-authenticated request and only fall back to the
+// anonymous request if that fails (never the other way around).
 async function resolveYoutube(q) {
-  try { return await findYoutube(q, false); }
+  if (!hasCookie()) return findYoutube(q, false);
+  try { return await findYoutube(q, true); }
   catch (e) {
-    if (!hasCookie()) throw e;
-    log('YouTube', 'Retrying with YOUTUBE_COOKIE: ' + e.message);
-    return findYoutube(q, true);
+    log('YouTube', 'Cookie attempt failed (' + e.message + '); retrying without cookie');
+    return findYoutube(q, false);
   }
 }
 async function findYoutubeCandidates(q, n, useCookie) {
@@ -230,9 +261,9 @@ async function autoplayNext(s, done) {
   ].filter(Boolean);
   for (const q of queries) {
     let cands = [];
-    try { cands = await findYoutubeCandidates(q, 10, false); }
+    try { cands = await findYoutubeCandidates(q, 10, hasCookie()); }
     catch (e) {
-      if (hasCookie()) { try { cands = await findYoutubeCandidates(q, 10, true); } catch (_) {} }
+      if (hasCookie()) { try { cands = await findYoutubeCandidates(q, 10, false); } catch (_) {} }
       if (!cands.length) { log('Player', 'Autoplay search failed (' + q + '): ' + e.message); continue; }
     }
     const pick = cands.find(t => t.url && !seen.has(t.url) && !/podcast|interview|tutorial|full album|mix\b|reaction/i.test(t.title));
@@ -248,32 +279,40 @@ function spotifyTrackId(value) {
 }
 async function spotifyMeta(url) {
   const id = spotifyTrackId(url);
+  // Parallel race: Spotify API vs yt-dlp music.youtube.com search.
+  // Spotify blocks oembed/scrape from datacenter IPs; yt-dlp ytmusic works.
+  const tasks = [];
   if (id && process.env.SPOTIFY_CLIENT_ID && process.env.SPOTIFY_CLIENT_SECRET) {
-    try {
-      const Spotify = require('spotify-web-api-node');
-      const api = new Spotify({ clientId: process.env.SPOTIFY_CLIENT_ID, clientSecret: process.env.SPOTIFY_CLIENT_SECRET });
-      api.setAccessToken((await api.clientCredentialsGrant()).body.access_token);
-      const t = (await api.getTrack(id)).body;
-      return { title: t.name, artist: t.artists.map(x => x.name).join(', '), duration: t.duration_ms, thumbnail: t.album.images[0] ? t.album.images[0].url : '' };
-    } catch (e) { const em = e && e.statusCode ? ('HTTP ' + e.statusCode) : ((e && e.message) || String(e)); log('Spotify', 'Web API unavailable (' + em + '); using public metadata'); }
+    tasks.push((async () => {
+      try {
+        const Spotify = require('spotify-web-api-node');
+        const api = new Spotify({ clientId: process.env.SPOTIFY_CLIENT_ID, clientSecret: process.env.SPOTIFY_CLIENT_SECRET });
+        api.setAccessToken((await api.clientCredentialsGrant()).body.access_token);
+        const t = (await api.getTrack(id)).body;
+        return { title: t.name, artist: t.artists.map(x => x.name).join(', '), duration: t.duration_ms, thumbnail: t.album.images[0] ? t.album.images[0].url : '' };
+      } catch (e) { log('Spotify', 'API getTrack failed (' + (e.statusCode || e.message) + ')'); return null; }
+    })());
   }
-  let title = '', artist = '', thumbnail = '';
-  try {
-    const r = await fetch('https://open.spotify.com/oembed?url=' + encodeURIComponent(url));
-    if (r.ok) { const j = await r.json(); title = j.title || ''; thumbnail = j.thumbnail_url || ''; }
-  } catch (_) {}
-  try {
-    const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Accept-Language': 'en' } });
-    if (r.ok) {
-      const html = await r.text();
-      const t = html.match(/<meta property="og:title" content="([^"]*)"/);
-      const d = html.match(/<meta property="og:description" content="([^"]*)"/);
-      if (t && !title) title = t[1];
-      if (d) { const first = d[1].split('\u00b7')[0].trim(); if (first) artist = first; }
-    }
-  } catch (_) {}
-  if (!title) throw Error('Could not read Spotify track metadata');
-  return { title: title, artist: artist, duration: 0, thumbnail: thumbnail };
+  tasks.push((async () => {
+    try {
+      const r = await fetch('https://open.spotify.com/oembed?url=' + encodeURIComponent(url));
+      if (!r.ok) return null;
+      const j = await r.json();
+      const raw = j.title || '';
+      if (!raw) return null;
+      const parts = raw.split(' - ');
+      const artist = parts.length > 1 ? parts[0] : '';
+      const track = parts.length > 1 ? parts.slice(1).join(' - ') : raw;
+      const info = await ytdlpJson('ytsearch1:' + (artist + ' ' + track).trim(), { cookie: hasCookie() });
+      const v = info.entries ? info.entries[0] : info;
+      return { title: track, artist: artist, duration: Number((v && v.duration) || 0) * 1000, thumbnail: j.thumbnail_url || (v && v.thumbnail) || '' };
+    } catch (_) { return null; }
+  })());
+  const race = tasks.map(t => Promise.resolve(t).then(r => { if (!r) throw new Error('skip'); return r; }));
+  const winner = await Promise.any(race).catch(() => null)
+    || await Promise.all(tasks.map(t => Promise.resolve(t).catch(() => null))).then(rs => rs.find(Boolean) || null);
+  if (winner) return winner;
+  throw Error('Could not read Spotify track metadata');
 }
 async function resolveSpotify(url) {
   const id = spotifyTrackId(url);
@@ -282,15 +321,11 @@ async function resolveSpotify(url) {
   const q = [meta.artist, meta.title].filter(Boolean).join(' ') || meta.title;
   log('Spotify', 'Resolving on YouTube: ' + q);
   let t = null;
-  try { t = await findYoutube(q, false); }
+  try { t = await findYoutube(q, hasCookie()); }
   catch (e) {
-    if (hasCookie()) { try { log('YouTube', 'Spotify resolve retry with YOUTUBE_COOKIE'); t = await findYoutube(q, true); } catch (_) {} }
     if (!t) {
       const fb = (await deezerSearch(q)) || (await spotifySearch(q));
-      if (fb && fb.preview) {
-        log('Spotify', 'YouTube unavailable; playing preview stream');
-        return { title: meta.title || fb.title, artist: meta.artist || fb.artist, url: fb.preview, duration: 30000, thumbnail: meta.thumbnail || '', platform: 'direct' };
-      }
+// ponytail: preview fallback removed per user request; upgrade path: restore if user re-enables previews
       throw e;
     }
   }
@@ -354,11 +389,11 @@ async function spotifyPlaylist(url) {
 }
 async function youtubePlaylist(url) {
   let info;
-  try { info = await ytdlpJson(url, { playlist: true, extra: ['--flat-playlist'] }); }
+  try { info = await ytdlpJson(url, { playlist: true, extra: ['--flat-playlist'], cookie: hasCookie() }); }
   catch (e) {
     if (!hasCookie()) throw e;
-    log('YouTube', 'Playlist retry with YOUTUBE_COOKIE: ' + e.message);
-    info = await ytdlpJson(url, { playlist: true, extra: ['--flat-playlist'], cookie: true });
+    log('YouTube', 'Playlist cookie attempt failed (' + e.message + '); retrying without cookie');
+    info = await ytdlpJson(url, { playlist: true, extra: ['--flat-playlist'] });
   }
   const entries = (info.entries || []).filter(Boolean).slice(0, MAX_PLAYLIST);
   if (!entries.length) throw Error('YouTube playlist is empty');
@@ -410,37 +445,25 @@ async function resolveOne(q) {
     if (!/\.(mp3|ogg|opus|wav|m4a|aac|flac)(\?|$)/i.test(u.pathname + u.search)) throw Error('URL must point to audio');
     return { title: path.basename(u.pathname), artist: u.hostname, url: u.href, duration: 0, thumbnail: '', platform: 'direct' };
   }
-  // Text query: yt-dlp (no cookie) -> Spotify/Deezer metadata -> yt-dlp (cookie) -> preview.
-  try { return await findYoutube(q, false); }
-  catch (e) {
-    log('YouTube', 'Search failed (' + e.message + '); trying Spotify fallback');
+// Parallel race: yt-dlp (cookie+anon) vs Spotify/Deezer metadata → YT search.
+  // First to resolve wins; losers are discarded silently.
+  const tasks = [];
+  tasks.push(findYoutube(q, hasCookie()).catch(() => null));
+  if (!hasCookie()) tasks.push(findYoutube(q, false).catch(() => null));
+  tasks.push((async () => {
     const fb = (await spotifySearch(q)) || (await deezerSearch(q));
-    if (fb) {
-      const retry = [fb.artist, fb.title].filter(Boolean).join(' ') || q;
-      log('Spotify', 'Fallback query: ' + retry);
-      try {
-        const t = await findYoutube(retry, false);
-        return { ...t, title: fb.title || t.title, artist: fb.artist || t.artist, platform: 'spotify' };
-      } catch (e2) {
-        if (hasCookie()) {
-          try {
-            log('YouTube', 'Retrying fallback with YOUTUBE_COOKIE');
-            const t = await findYoutube(retry, true);
-            return { ...t, title: fb.title || t.title, artist: fb.artist || t.artist, platform: 'spotify' };
-          } catch (_) {}
-        }
-        if (fb.preview) {
-          log('Spotify', 'YouTube unavailable; playing preview stream');
-          return { title: fb.title, artist: fb.artist, url: fb.preview, duration: 30000, thumbnail: '', platform: 'direct' };
-        }
-      }
-    }
-    if (hasCookie()) {
-      try { log('YouTube', 'Retrying search with YOUTUBE_COOKIE'); return await findYoutube(q, true); }
-      catch (e3) { log('YouTube', 'Cookie retry failed: ' + e3.message); }
-    }
-    throw e;
-  }
+    if (!fb) return null;
+    const retry = [fb.artist, fb.title].filter(Boolean).join(' ') || q;
+    try {
+      const t = await findYoutube(retry, hasCookie());
+      return { ...t, title: fb.title || t.title, artist: fb.artist || t.artist, platform: 'spotify' };
+    } catch (_) { return null; }
+  })());
+  const race = tasks.map(t => Promise.resolve(t).then(r => { if (!r) throw new Error('skip'); return r; }));
+  const winner = await Promise.any(race).catch(() => null)
+    || await Promise.all(tasks.map(t => Promise.resolve(t).catch(() => null))).then(rs => rs.find(Boolean) || null);
+  if (winner) return winner;
+  throw Error('No result from any source');
 }
 
 async function prepareTrack(s, track) {
@@ -470,13 +493,9 @@ async function playCurrent(s, g) {
   s.player.play(resource); s.status = 'playing';
   log('Player', 'Playing ' + t.title);
 }
-// A track that was already playing failed mid-stream (network/ffmpeg/yt-dlp).
-// Bump the generation, stop the player and advance to the next item.
-// A track that was already playing failed mid-stream (network/ffmpeg/yt-dlp).
-// If it was a YouTube track resolved without cookies, retry it once with the
-// cookie before giving up; otherwise skip to the next item.
-// A track failed mid-stream (network/ffmpeg/yt-dlp 403). yt-dlp-backed tracks are
-// retried once with the cookie and once with an alternate player client, then skipped.
+// A track failed mid-stream (network/ffmpeg/yt-dlp 403). yt-dlp-backed tracks
+// are retried twice with alternate player clients (cookies are already used on
+// the first attempt), then dropped from the queue so playback can continue.
 function streamFailed(s, g, err) {
   if (g !== s.generation) return;
   const failed = s.currentTrack;
@@ -488,9 +507,10 @@ function streamFailed(s, g, err) {
   const ytdlpTrack = failed && failed.url && failed.platform !== 'direct';
   if (ytdlpTrack && (failed.attempt || 0) < 2) {
     const attempt = (failed.attempt || 0) + 1;
-    const useCookie = attempt === 1 && hasCookie() && !failed.cookie;
-    log('YouTube', 'Stream failed (' + s.error + '); retry ' + attempt + (useCookie ? ' with cookie' : ' with alternate client'));
-    s.queue.unshift({ ...failed, attempt, cookie: useCookie || !!failed.cookie, client: attempt >= 2 ? 'tv_embedded' : undefined });
+    const useCookie = hasCookie() && !failed.cookie;
+    const client = useCookie ? undefined : (attempt === 1 ? 'tv_embedded' : 'web_safari');
+    log('YouTube', 'Stream failed (' + s.error + '); retry ' + attempt + (useCookie ? ' with cookie' : ' with client ' + client));
+    s.queue.unshift({ ...failed, attempt, cookie: useCookie || !!failed.cookie, client });
   } else if (failed && failed.url) {
     log('Player', 'Giving up on "' + (failed.title || failed.url) + '": ' + s.error);
     s.recent.unshift(failed.url); s.recent = s.recent.slice(0, 20);
@@ -564,6 +584,7 @@ function kick(s, manualSkip) {
 async function enqueue(s, query) {
   query = String(query || '').trim();
   if (!query) throw Error('Song title or URL required');
+  s.epoch++; // cancel any in-flight advance so concurrent text queries don't race
   const startIdle = !s.currentTrack || ['idle', 'error', 'disconnected'].includes(s.status);
   if (isPlaylistQuery(query)) {
     const tracks = await resolvePlaylist(query);

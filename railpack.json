@@ -5,7 +5,9 @@
     "yt-dlp": "latest"
   },
   "deploy": {
-    "aptPackages": ["...", "ffmpeg"],
+    "aptPackages": [
+      "ffmpeg"
+    ],
     "startCommand": "npm start"
   }
 }
